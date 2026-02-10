@@ -48,6 +48,7 @@ GRAPH_BASE_URL = "https://graph.facebook.com"
 RATE_LIMIT_CODES = {4, 17, 32, 613}
 FATAL_AUTH_PERMISSION_CODES = {10, 190, 200}
 INVALID_METRIC_CODE = 100
+INVALID_QUERY_CODE = 3001
 
 POST_FIELDS_CANDIDATES = [
     # Stable minimal baseline first.
@@ -486,12 +487,15 @@ def _probe_metrics_from_candidates(url: str) -> List[str]:
                     "period": "lifetime",
                     "access_token": ACCESS_TOKEN,
                 },
-                non_retryable_graph_codes={INVALID_METRIC_CODE},
+                non_retryable_graph_codes={INVALID_METRIC_CODE, INVALID_QUERY_CODE},
             )
             valid.append(metric)
         except GraphAPIError as exc:
             if exc.code == INVALID_METRIC_CODE:
                 continue
+            if exc.code == INVALID_QUERY_CODE:
+                # Endpoint is not queryable for this post/context; skip quickly.
+                return []
             raise
     return valid
 
@@ -512,14 +516,14 @@ def resolve_valid_metrics_for_group(sample_post_id: str, group_key: str) -> List
                 "period": "lifetime",
                 "access_token": ACCESS_TOKEN,
             },
-            non_retryable_graph_codes={INVALID_METRIC_CODE},
+            non_retryable_graph_codes={INVALID_METRIC_CODE, INVALID_QUERY_CODE},
         )
         names = [item.get("name") for item in payload.get("data", []) if item.get("name")]
         valid = [name for name in names if isinstance(name, str)]
         raw_payload = payload
     except GraphAPIError as exc:
         # Some versions require an explicit metric parameter.
-        if exc.code != INVALID_METRIC_CODE:
+        if exc.code not in {INVALID_METRIC_CODE, INVALID_QUERY_CODE}:
             raise
 
     if not valid:
@@ -558,16 +562,28 @@ def fetch_post_insights(post_id: str, valid_metrics: List[str], group_key: str) 
             "access_token": ACCESS_TOKEN,
         }
         try:
-            data = graph_get(url, params, non_retryable_graph_codes={INVALID_METRIC_CODE})
+            data = graph_get(
+                url,
+                params,
+                non_retryable_graph_codes={INVALID_METRIC_CODE, INVALID_QUERY_CODE},
+            )
             group_info = _METRICS_DEBUG["groups"].get(group_key, {})
             if group_info.get("raw_insights_payload") is None:
                 group_info["raw_insights_payload"] = data
             if _DEBUG_ENABLED:
                 logging.debug("Raw insights payload for post %s: %s", post_id, data)
-            return _zero_insights()
+            return parse_insights(data)
         except GraphAPIError as exc:
+            if exc.code == INVALID_QUERY_CODE:
+                # Common for posts where insights are not available via this edge.
+                _METRIC_DISCOVERY_CACHE[group_key] = []
+                group_info = _METRICS_DEBUG["groups"].get(group_key, {})
+                group_info["valid_metrics"] = []
+                return _zero_insights()
+
             if exc.code != INVALID_METRIC_CODE:
                 raise
+
             invalid_name = _extract_invalid_metric_name(str(exc))
             if invalid_name and invalid_name in metrics_to_request:
                 metrics_to_request.remove(invalid_name)
@@ -578,7 +594,7 @@ def fetch_post_insights(post_id: str, valid_metrics: List[str], group_key: str) 
                 continue
             break
 
-    return parse_insights(data)
+    return _zero_insights()
 
 
 def post_to_base_row(post: Dict[str, Any], page_name: str) -> Dict[str, Any]:
@@ -606,7 +622,26 @@ def build_rows(posts: List[Dict[str, Any]], page_name: str) -> List[Dict[str, An
 
         valid_metrics: List[str] = []
         if post_id:
-            valid_metrics = resolve_valid_metrics_for_group(post_id, group_key)
+            try:
+                valid_metrics = resolve_valid_metrics_for_group(post_id, group_key)
+            except Exception as exc:
+                logging.warning(
+                    "Metric discovery failed for post %s (group %s); using zeroed insights. Error: %s",
+                    post_id,
+                    group_key,
+                    exc,
+                )
+                _METRIC_DISCOVERY_CACHE[group_key] = []
+                group_info = _METRICS_DEBUG["groups"].setdefault(
+                    group_key,
+                    {
+                        "sample_post_id": post_id,
+                        "valid_metrics": [],
+                        "posts_processed": 0,
+                        "raw_insights_payload": None,
+                    },
+                )
+                group_info["valid_metrics"] = []
         else:
             logging.warning("Post missing id; insight fields will be zeroed.")
 
