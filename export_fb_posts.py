@@ -15,10 +15,12 @@ Notes:
 
 import csv
 import datetime
+import json
 import logging
 import os
 import random
 import time
+import argparse
 from typing import Any, Dict, List, Optional, Set
 
 import requests
@@ -33,6 +35,7 @@ ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", ACCESS_TOKEN_PLACEHOLDER)
 SINCE = "2026-01-01"  # YYYY-MM-DD
 UNTIL = "2026-01-31"  # YYYY-MM-DD
 OUTPUT_FILE = "fb_page_posts_report.csv"
+METRICS_DEBUG_FILE = "metrics_debug.json"
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_RETRIES = 6
 BASE_BACKOFF_SECONDS = 2
@@ -47,36 +50,31 @@ FATAL_AUTH_PERMISSION_CODES = {10, 190, 200}
 INVALID_METRIC_CODE = 100
 
 POST_FIELDS_CANDIDATES = [
-    # Preferred shape with richer metadata.
+    # Stable minimal baseline first.
+    "id,created_time,permalink_url,message,status_type",
+    # Fallback with story if message-only payload is constrained.
+    "id,created_time,permalink_url,message,story,status_type",
+    # Richer metadata (can fail on some pages/apps).
     "id,created_time,permalink_url,message,story,status_type,type",
-    # Fallback for pages/accounts that reject post aggregated attachment fields.
-    "id,created_time,permalink_url,message,story,type",
-    # Minimal baseline fallback.
-    "id,created_time,permalink_url,message,story",
+    # Last-resort fallback.
+    "id,created_time,permalink_url,message",
 ]
 
 INSIGHT_METRICS_CANDIDATES = [
-    "post_impressions",
     "post_impressions_unique",
-    "post_impressions_organic",
-    "post_impressions_paid",
-    "post_reach",
-    "post_reach_organic",
-    "post_reach_paid",
-    "post_media_view",  # fallback in newer Graph changes for some pages
-    "post_engaged_users",
+    "post_media_view",
+    "post_media_views",
+    "post_views",
+    "post_video_views",
+    "post_total_views",
     "post_clicks",
     "post_clicks_unique",
     "post_clicks_by_type",
     "post_reactions_by_type_total",
-    "post_comments",
-    "post_shares",
-    "post_negative_feedback",
-    "post_negative_feedback_unique",
-    "post_video_views_3s",
-    "post_video_views_1m",
     "post_video_view_time",
     "post_video_avg_time_watched",
+    "post_video_views_3s",
+    "post_video_views_1m",
     "post_video_views_3s_by_age_bucket_and_gender",
 ]
 
@@ -136,7 +134,10 @@ BASE_COLUMNS = {
     "Post type",
 }
 
-_VALID_METRICS_CACHE: Optional[List[str]] = None
+_METRIC_DISCOVERY_CACHE: Dict[str, List[str]] = {}
+_METRICS_DEBUG: Dict[str, Any] = {"graph_version": GRAPH_VERSION, "groups": {}}
+_METRIC_USAGE_COUNTS: Dict[str, int] = {}
+_DEBUG_ENABLED = False
 
 
 class FatalGraphAPIError(RuntimeError):
@@ -151,6 +152,23 @@ class GraphAPIError(RuntimeError):
         self.code = code
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Export Facebook page posts and compatible insights metrics (read-only)."
+    )
+    parser.add_argument("--since", default=SINCE, help="Start date YYYY-MM-DD")
+    parser.add_argument("--until", default=UNTIL, help="End date YYYY-MM-DD")
+    parser.add_argument("--page-id", default=PAGE_ID, help="Facebook Page ID")
+    parser.add_argument("--graph-version", default=GRAPH_VERSION, help="Graph API version")
+    parser.add_argument("--output", default=OUTPUT_FILE, help="CSV output file path")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging and write metrics_debug.json",
+    )
+    return parser.parse_args()
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -162,6 +180,26 @@ def setup_logging() -> None:
 def parse_date_to_unix(date_str: str) -> int:
     dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
     return int(dt.replace(tzinfo=datetime.timezone.utc).timestamp())
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _looks_like_invalid_fields_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "field" in text
+        and (
+            "invalid" in text
+            or "unsupported" in text
+            or "unknown" in text
+            or "cannot be accessed" in text
+        )
+    )
 
 
 def _safe_error_summary(error_obj: Dict[str, Any]) -> str:
@@ -285,14 +323,13 @@ def fetch_posts() -> List[Dict[str, Any]]:
         try:
             payload = graph_get(url, params, non_retryable_graph_codes={12})
         except GraphAPIError as exc:
-            is_attachment_aggregation_deprecation = (
-                exc.code == 12
-                and "deprecate_post_aggregated_fields_for_attachement" in str(exc)
-                and url.endswith("/posts")
+            is_field_related_error = (
+                url.endswith("/posts")
                 and "fields" in params
+                and _looks_like_invalid_fields_error(exc)
             )
             if (
-                is_attachment_aggregation_deprecation
+                is_field_related_error
                 and fields_index + 1 < len(POST_FIELDS_CANDIDATES)
             ):
                 fields_index += 1
@@ -348,53 +385,66 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
         metrics[name] = _value_from_insight(item)
 
-    impressions = metrics.get("post_impressions", 0) or metrics.get("post_media_view", 0)
+    impression_fallback_metric_names = [
+        "post_impressions",
+        "post_media_view",
+        "post_media_views",
+        "post_views",
+        "post_total_views",
+        "post_video_views",
+    ]
+    impressions = 0
+    for metric_name in impression_fallback_metric_names:
+        value = metrics.get(metric_name, 0)
+        if _safe_int(value) > 0:
+            impressions = value
+            break
 
-    result["Impressions"] = int(impressions or 0)
-    result["Impressions (Unique)"] = int(metrics.get("post_impressions_unique", 0) or 0)
-    result["Impressions (Organic)"] = int(metrics.get("post_impressions_organic", 0) or 0)
-    result["Impressions (Paid/Boosted)"] = int(metrics.get("post_impressions_paid", 0) or 0)
-    result["Reach"] = int(metrics.get("post_reach", 0) or 0)
-    result["Reach (Organic)"] = int(metrics.get("post_reach_organic", 0) or 0)
-    result["Reach (Paid/Boosted)"] = int(metrics.get("post_reach_paid", 0) or 0)
-    result["Engaged users"] = int(metrics.get("post_engaged_users", 0) or 0)
-    result["Comments"] = int(metrics.get("post_comments", 0) or 0)
-    result["Shares"] = int(metrics.get("post_shares", 0) or 0)
-    result["Negative feedback"] = int(metrics.get("post_negative_feedback", 0) or 0)
-    result["Negative feedback (Unique)"] = int(metrics.get("post_negative_feedback_unique", 0) or 0)
+    result["Impressions"] = _safe_int(impressions)
+    result["Impressions (Unique)"] = _safe_int(metrics.get("post_impressions_unique", 0))
+    result["Impressions (Organic)"] = _safe_int(metrics.get("post_impressions_organic", 0))
+    result["Impressions (Paid/Boosted)"] = _safe_int(metrics.get("post_impressions_paid", 0))
+    result["Reach"] = _safe_int(metrics.get("post_reach", 0))
+    result["Reach (Organic)"] = _safe_int(metrics.get("post_reach_organic", 0))
+    result["Reach (Paid/Boosted)"] = _safe_int(metrics.get("post_reach_paid", 0))
+    result["Engaged users"] = _safe_int(metrics.get("post_engaged_users", 0))
+    result["Comments"] = _safe_int(metrics.get("post_comments", 0))
+    result["Shares"] = _safe_int(metrics.get("post_shares", 0))
+    result["Negative feedback"] = _safe_int(metrics.get("post_negative_feedback", 0))
+    result["Negative feedback (Unique)"] = _safe_int(metrics.get("post_negative_feedback_unique", 0))
 
     reactions = metrics.get("post_reactions_by_type_total", {})
     if isinstance(reactions, dict):
-        result["Reactions (like)"] = int(reactions.get("like", 0) or 0)
-        result["Reactions (love)"] = int(reactions.get("love", 0) or 0)
-        result["Reactions (wow)"] = int(reactions.get("wow", 0) or 0)
-        result["Reactions (haha)"] = int(reactions.get("haha", 0) or 0)
-        result["Reactions (sad)"] = int(reactions.get("sad", 0) or 0)
-        result["Reactions (angry)"] = int(reactions.get("angry", 0) or 0)
-        result["Reactions (Total)"] = int(sum(int(v or 0) for v in reactions.values()))
+        result["Reactions (like)"] = _safe_int(reactions.get("like", 0))
+        result["Reactions (love)"] = _safe_int(reactions.get("love", 0))
+        result["Reactions (wow)"] = _safe_int(reactions.get("wow", 0))
+        result["Reactions (haha)"] = _safe_int(reactions.get("haha", 0))
+        result["Reactions (sad)"] = _safe_int(reactions.get("sad", 0))
+        result["Reactions (angry)"] = _safe_int(reactions.get("angry", 0))
+        result["Reactions (Total)"] = int(sum(_safe_int(v) for v in reactions.values()))
 
     clicks_breakdown = metrics.get("post_clicks_by_type", {})
     total_clicks = metrics.get("post_clicks", 0)
     link_clicks = 0
     other_clicks = 0
     if isinstance(clicks_breakdown, dict):
-        link_clicks = int(
-            clicks_breakdown.get("link clicks", clicks_breakdown.get("link_clicks", 0)) or 0
+        link_clicks = _safe_int(
+            clicks_breakdown.get("link clicks", clicks_breakdown.get("link_clicks", 0))
         )
-        breakdown_total = int(sum(int(v or 0) for v in clicks_breakdown.values()))
+        breakdown_total = int(sum(_safe_int(v) for v in clicks_breakdown.values()))
         other_clicks = max(0, breakdown_total - link_clicks)
         if not total_clicks:
             total_clicks = breakdown_total
 
-    result["Total clicks"] = int(total_clicks or 0)
+    result["Total clicks"] = _safe_int(total_clicks)
     result["Link Clicks"] = link_clicks
     result["Other Clicks"] = other_clicks
 
-    result["3-second video views"] = int(metrics.get("post_video_views_3s", 0) or 0)
-    result["1-minute video views"] = int(metrics.get("post_video_views_1m", 0) or 0)
-    result["Seconds viewed (video view time)"] = int(metrics.get("post_video_view_time", 0) or 0)
-    result["Average seconds viewed (video avg time watched)"] = int(
-        metrics.get("post_video_avg_time_watched", 0) or 0
+    result["3-second video views"] = _safe_int(metrics.get("post_video_views_3s", 0))
+    result["1-minute video views"] = _safe_int(metrics.get("post_video_views_1m", 0))
+    result["Seconds viewed (video view time)"] = _safe_int(metrics.get("post_video_view_time", 0))
+    result["Average seconds viewed (video avg time watched)"] = _safe_int(
+        metrics.get("post_video_avg_time_watched", 0)
     )
 
     video_age_gender = metrics.get("post_video_views_3s_by_age_bucket_and_gender", {})
@@ -414,25 +464,19 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
             "F.65+": "3s_views_F_65_plus",
         }
         for src_key, out_key in mapping.items():
-            result[out_key] = int(video_age_gender.get(src_key, 0) or 0)
+            result[out_key] = _safe_int(video_age_gender.get(src_key, 0))
 
     return result
 
 
-def resolve_valid_metrics_for_run(sample_post_id: str) -> List[str]:
-    """
-    Detect valid metrics once by testing each candidate individually.
-    Invalid metric code (#100) is treated as non-retryable for fast skipping.
-    """
-    global _VALID_METRICS_CACHE
-    if _VALID_METRICS_CACHE is not None:
-        return _VALID_METRICS_CACHE
+def _derive_post_group_key(post: Dict[str, Any]) -> str:
+    status_type = post.get("status_type") or "unknown_status"
+    post_type = post.get("type") or "unknown_type"
+    return f"status_type={status_type}|type={post_type}"
 
-    url = f"{GRAPH_BASE_URL}/{GRAPH_VERSION}/{sample_post_id}/insights"
+
+def _probe_metrics_from_candidates(url: str) -> List[str]:
     valid: List[str] = []
-
-    logging.info("Discovering valid insights metrics (this happens once per run)...")
-
     for metric in INSIGHT_METRICS_CANDIDATES:
         try:
             graph_get(
@@ -445,30 +489,95 @@ def resolve_valid_metrics_for_run(sample_post_id: str) -> List[str]:
                 non_retryable_graph_codes={INVALID_METRIC_CODE},
             )
             valid.append(metric)
-        except FatalGraphAPIError:
-            raise
         except GraphAPIError as exc:
             if exc.code == INVALID_METRIC_CODE:
-                logging.info("Metric unsupported/deprecated; skipping: %s", metric)
                 continue
             raise
-
-    _VALID_METRICS_CACHE = valid
-    logging.info("Valid metrics selected for run: %s", ",".join(valid) if valid else "(none)")
     return valid
 
 
-def fetch_post_insights(post_id: str, valid_metrics: List[str]) -> Dict[str, Any]:
+def resolve_valid_metrics_for_group(sample_post_id: str, group_key: str) -> List[str]:
+    if group_key in _METRIC_DISCOVERY_CACHE:
+        return _METRIC_DISCOVERY_CACHE[group_key]
+
+    url = f"{GRAPH_BASE_URL}/{GRAPH_VERSION}/{sample_post_id}/insights"
+    valid: List[str] = []
+    raw_payload: Optional[Dict[str, Any]] = None
+
+    # First preference: discover available metrics from Graph directly.
+    try:
+        payload = graph_get(
+            url,
+            {
+                "period": "lifetime",
+                "access_token": ACCESS_TOKEN,
+            },
+            non_retryable_graph_codes={INVALID_METRIC_CODE},
+        )
+        names = [item.get("name") for item in payload.get("data", []) if item.get("name")]
+        valid = [name for name in names if isinstance(name, str)]
+        raw_payload = payload
+    except GraphAPIError as exc:
+        # Some versions require an explicit metric parameter.
+        if exc.code != INVALID_METRIC_CODE:
+            raise
+
+    if not valid:
+        valid = _probe_metrics_from_candidates(url)
+
+    _METRIC_DISCOVERY_CACHE[group_key] = valid
+    _METRICS_DEBUG["groups"][group_key] = {
+        "sample_post_id": sample_post_id,
+        "valid_metrics": valid,
+        "posts_processed": 0,
+        "raw_insights_payload": raw_payload,
+    }
+    logging.info("Metrics for %s: %s", group_key, ",".join(valid) if valid else "(none)")
+    return valid
+
+
+def _extract_invalid_metric_name(error_message: str) -> Optional[str]:
+    marker = "The value must be a valid insights metric"
+    if marker not in error_message:
+        return None
+    if ":" not in error_message:
+        return None
+    return error_message.split(":", 1)[-1].strip().strip(".'\"")
+
+
+def fetch_post_insights(post_id: str, valid_metrics: List[str], group_key: str) -> Dict[str, Any]:
     if not valid_metrics:
         return _zero_insights()
 
     url = f"{GRAPH_BASE_URL}/{GRAPH_VERSION}/{post_id}/insights"
-    params = {
-        "metric": ",".join(valid_metrics),
-        "period": "lifetime",
-        "access_token": ACCESS_TOKEN,
-    }
-    data = graph_get(url, params)
+    metrics_to_request = list(valid_metrics)
+    while metrics_to_request:
+        params = {
+            "metric": ",".join(metrics_to_request),
+            "period": "lifetime",
+            "access_token": ACCESS_TOKEN,
+        }
+        try:
+            data = graph_get(url, params, non_retryable_graph_codes={INVALID_METRIC_CODE})
+            group_info = _METRICS_DEBUG["groups"].get(group_key, {})
+            if group_info.get("raw_insights_payload") is None:
+                group_info["raw_insights_payload"] = data
+            if _DEBUG_ENABLED:
+                logging.debug("Raw insights payload for post %s: %s", post_id, data)
+            return _zero_insights()
+        except GraphAPIError as exc:
+            if exc.code != INVALID_METRIC_CODE:
+                raise
+            invalid_name = _extract_invalid_metric_name(str(exc))
+            if invalid_name and invalid_name in metrics_to_request:
+                metrics_to_request.remove(invalid_name)
+                cached = _METRIC_DISCOVERY_CACHE.get(group_key, [])
+                _METRIC_DISCOVERY_CACHE[group_key] = [m for m in cached if m != invalid_name]
+                group_info = _METRICS_DEBUG["groups"].get(group_key, {})
+                group_info["valid_metrics"] = _METRIC_DISCOVERY_CACHE[group_key]
+                continue
+            break
+
     return parse_insights(data)
 
 
@@ -487,27 +596,22 @@ def build_rows(posts: List[Dict[str, Any]], page_name: str) -> List[Dict[str, An
     rows: List[Dict[str, Any]] = []
     total = len(posts)
 
-    sample_post_id = ""
-    for post in posts:
-        pid = post.get("id")
-        if pid:
-            sample_post_id = pid
-            break
-
-    valid_metrics: List[str] = []
-    if sample_post_id:
-        valid_metrics = resolve_valid_metrics_for_run(sample_post_id)
-    else:
-        logging.warning("No post IDs found; insight fields will be zeroed.")
-
     for idx, post in enumerate(posts, start=1):
         post_id = post.get("id", "")
         logging.info("Processing post %d/%d: %s", idx, total, post_id)
 
         row = post_to_base_row(post, page_name)
+        group_key = _derive_post_group_key(post)
+        _METRIC_USAGE_COUNTS[group_key] = _METRIC_USAGE_COUNTS.get(group_key, 0) + 1
+
+        valid_metrics: List[str] = []
+        if post_id:
+            valid_metrics = resolve_valid_metrics_for_group(post_id, group_key)
+        else:
+            logging.warning("Post missing id; insight fields will be zeroed.")
 
         try:
-            insights = fetch_post_insights(post_id, valid_metrics)
+            insights = fetch_post_insights(post_id, valid_metrics, group_key)
         except FatalGraphAPIError:
             raise
         except Exception as exc:
@@ -517,6 +621,9 @@ def build_rows(posts: List[Dict[str, Any]], page_name: str) -> List[Dict[str, An
                 exc,
             )
             insights = _zero_insights()
+
+        if group_key in _METRICS_DEBUG["groups"]:
+            _METRICS_DEBUG["groups"][group_key]["posts_processed"] += 1
 
         row.update(insights)
         normalized_row = {
@@ -535,6 +642,23 @@ def write_csv(rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def write_metrics_debug() -> None:
+    with open(METRICS_DEBUG_FILE, "w", encoding="utf-8") as debug_file:
+        json.dump(_METRICS_DEBUG, debug_file, indent=2, ensure_ascii=False)
+
+
+def print_metric_summary() -> None:
+    logging.info("Insights metrics summary by post group:")
+    for group_key, count in sorted(_METRIC_USAGE_COUNTS.items()):
+        metrics = _METRIC_DISCOVERY_CACHE.get(group_key, [])
+        logging.info(
+            "Group=%s | posts=%d | valid_metrics=%s",
+            group_key,
+            count,
+            ",".join(metrics) if metrics else "(none)",
+        )
+
+
 def validate_config() -> None:
     if PAGE_ID == "<PAGE_ID>":
         raise FatalGraphAPIError("PAGE_ID is not configured. Set PAGE_ID constant.")
@@ -545,7 +669,20 @@ def validate_config() -> None:
 
 
 def main() -> None:
+    global PAGE_ID, SINCE, UNTIL, OUTPUT_FILE, GRAPH_VERSION, _DEBUG_ENABLED, _METRICS_DEBUG
+
+    args = parse_args()
+    PAGE_ID = args.page_id
+    SINCE = args.since
+    UNTIL = args.until
+    OUTPUT_FILE = args.output
+    GRAPH_VERSION = args.graph_version
+    _DEBUG_ENABLED = args.debug
+    _METRICS_DEBUG = {"graph_version": GRAPH_VERSION, "groups": {}}
+
     setup_logging()
+    if _DEBUG_ENABLED:
+        logging.getLogger().setLevel(logging.DEBUG)
     validate_config()
 
     logging.info("Starting Facebook Page export (read-only mode).")
@@ -566,6 +703,11 @@ def main() -> None:
 
     rows = build_rows(posts, page_name)
     write_csv(rows)
+    print_metric_summary()
+
+    if _DEBUG_ENABLED:
+        write_metrics_debug()
+        logging.info("Metrics debug output: %s", METRICS_DEBUG_FILE)
 
     logging.info("Export complete.")
     logging.info("Total posts fetched: %d", total_posts)
