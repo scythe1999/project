@@ -46,7 +46,14 @@ RATE_LIMIT_CODES = {4, 17, 32, 613}
 FATAL_AUTH_PERMISSION_CODES = {10, 190, 200}
 INVALID_METRIC_CODE = 100
 
-POST_FIELDS = "id,created_time,permalink_url,message,story,status_type,type"
+POST_FIELDS_CANDIDATES = [
+    # Preferred shape with richer metadata.
+    "id,created_time,permalink_url,message,story,status_type,type",
+    # Fallback for pages/accounts that reject post aggregated attachment fields.
+    "id,created_time,permalink_url,message,story,type",
+    # Minimal baseline fallback.
+    "id,created_time,permalink_url,message,story",
+]
 
 INSIGHT_METRICS_CANDIDATES = [
     "post_impressions",
@@ -263,8 +270,9 @@ def fetch_page_name() -> str:
 
 def fetch_posts() -> List[Dict[str, Any]]:
     url = f"{GRAPH_BASE_URL}/{GRAPH_VERSION}/{PAGE_ID}/posts"
+    fields_index = 0
     params: Dict[str, Any] = {
-        "fields": POST_FIELDS,
+        "fields": POST_FIELDS_CANDIDATES[fields_index],
         "since": parse_date_to_unix(SINCE),
         "until": parse_date_to_unix(UNTIL),
         "limit": 100,
@@ -274,7 +282,28 @@ def fetch_posts() -> List[Dict[str, Any]]:
     posts: List[Dict[str, Any]] = []
 
     while True:
-        payload = graph_get(url, params)
+        try:
+            payload = graph_get(url, params, non_retryable_graph_codes={12})
+        except GraphAPIError as exc:
+            is_attachment_aggregation_deprecation = (
+                exc.code == 12
+                and "deprecate_post_aggregated_fields_for_attachement" in str(exc)
+                and url.endswith("/posts")
+                and "fields" in params
+            )
+            if (
+                is_attachment_aggregation_deprecation
+                and fields_index + 1 < len(POST_FIELDS_CANDIDATES)
+            ):
+                fields_index += 1
+                params["fields"] = POST_FIELDS_CANDIDATES[fields_index]
+                logging.warning(
+                    "Posts field set rejected by Graph API; retrying with fallback fields: %s",
+                    params["fields"],
+                )
+                continue
+            raise
+
         batch = payload.get("data", [])
 
         for post in batch:
