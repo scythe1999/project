@@ -420,6 +420,19 @@ def _normalize_breakdown_value(raw_value: Any) -> Dict[str, Any]:
     if isinstance(raw_value, list):
         merged: Dict[str, Any] = {}
         for item in raw_value:
+            if isinstance(item, dict):
+                # Some Graph responses return list rows as {"key": "M.18-24", "value": 12}
+                # or {"dimension_values": [...], "value": 12} instead of a direct dict map.
+                list_key = None
+                if "key" in item:
+                    list_key = _normalize_age_gender_key(item.get("key"))
+                elif "dimension_values" in item:
+                    list_key = _normalize_age_gender_from_dimensions(item.get("dimension_values"))
+
+                if list_key:
+                    merged[list_key] = merged.get(list_key, 0) + _safe_int(item.get("value", 0))
+                    continue
+
             normalized = _normalize_breakdown_value(item)
             if not isinstance(normalized, dict):
                 continue
@@ -428,6 +441,11 @@ def _normalize_breakdown_value(raw_value: Any) -> Dict[str, Any]:
         return merged
 
     if isinstance(raw_value, dict):
+        if "key" in raw_value and "value" in raw_value:
+            normalized_key = _normalize_age_gender_key(raw_value.get("key"))
+            if normalized_key:
+                return {normalized_key: _safe_int(raw_value.get("value", 0))}
+
         if "value" in raw_value and isinstance(raw_value["value"], dict):
             return raw_value["value"]
         if "total_value" in raw_value and isinstance(raw_value["total_value"], dict):
@@ -457,6 +475,11 @@ def _normalize_breakdown_value(raw_value: Any) -> Dict[str, Any]:
                 normalized[normalized_key] = normalized.get(normalized_key, 0) + value
             if normalized:
                 return normalized
+
+        if "data" in raw_value and isinstance(raw_value["data"], list):
+            normalized_data = _normalize_breakdown_value(raw_value["data"])
+            if normalized_data:
+                return normalized_data
         return raw_value
     return {}
 
