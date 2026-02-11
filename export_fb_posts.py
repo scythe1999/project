@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import argparse
 from typing import Any, Dict, List, Optional, Set
@@ -401,14 +402,30 @@ def _value_from_insight(item: Dict[str, Any]) -> Any:
     values = item.get("values", [])
     if not values:
         return 0
-    first = values[0]
-    if not isinstance(first, dict):
+    extracted_values: List[Any] = []
+    for value_item in values:
+        if isinstance(value_item, dict) and "value" in value_item:
+            extracted_values.append(value_item.get("value", 0))
+
+    if not extracted_values:
         return 0
-    return first.get("value", 0)
+    if len(extracted_values) == 1:
+        return extracted_values[0]
+    return extracted_values
 
 
 def _normalize_breakdown_value(raw_value: Any) -> Dict[str, Any]:
     """Normalize Graph API breakdown payloads to a flat dict shape."""
+    if isinstance(raw_value, list):
+        merged: Dict[str, Any] = {}
+        for item in raw_value:
+            normalized = _normalize_breakdown_value(item)
+            if not isinstance(normalized, dict):
+                continue
+            for key, value in normalized.items():
+                merged[key] = _safe_int(merged.get(key, 0)) + _safe_int(value)
+        return merged
+
     if isinstance(raw_value, dict):
         if "value" in raw_value and isinstance(raw_value["value"], dict):
             return raw_value["value"]
@@ -416,9 +433,55 @@ def _normalize_breakdown_value(raw_value: Any) -> Dict[str, Any]:
             nested_total = raw_value["total_value"]
             if "value" in nested_total and isinstance(nested_total["value"], dict):
                 return nested_total["value"]
+            if "breakdowns" in nested_total:
+                return _normalize_breakdown_value(nested_total["breakdowns"])
             return nested_total
+        if "breakdowns" in raw_value:
+            return _normalize_breakdown_value(raw_value["breakdowns"])
+        if "results" in raw_value and isinstance(raw_value["results"], list):
+            normalized: Dict[str, Any] = {}
+            for result in raw_value["results"]:
+                if not isinstance(result, dict):
+                    continue
+                dimensions = result.get("dimension_values", [])
+                value = _safe_int(result.get("value", 0))
+                if not isinstance(dimensions, list) or len(dimensions) < 2:
+                    continue
+                age_bucket = str(dimensions[0]).strip()
+                gender_raw = str(dimensions[1]).strip().upper()
+                if gender_raw in {"MALE", "MAN", "BOY"}:
+                    gender = "M"
+                elif gender_raw in {"FEMALE", "WOMAN", "GIRL"}:
+                    gender = "F"
+                else:
+                    gender = gender_raw
+                if not age_bucket or gender not in {"M", "F"}:
+                    continue
+                normalized[f"{gender}.{age_bucket}"] = normalized.get(f"{gender}.{age_bucket}", 0) + value
+            if normalized:
+                return normalized
         return raw_value
     return {}
+
+
+def _normalize_age_gender_key(raw_key: Any) -> Optional[str]:
+    key = str(raw_key or "").strip()
+    if not key:
+        return None
+
+    key_upper = key.upper().replace("_", ".")
+    key_upper = re.sub(r"\s+", "", key_upper)
+    match = re.search(r"\b(M|F|MALE|FEMALE)\b", key_upper)
+    age_match = re.search(r"(18[-.]?24|25[-.]?34|35[-.]?44|45[-.]?54|55[-.]?64|65\+)", key_upper)
+    if not match or not age_match:
+        return None
+
+    gender_token = match.group(1)
+    gender = "M" if gender_token in {"M", "MALE"} else "F"
+    age = age_match.group(1).replace(".", "-")
+    if age == "65+":
+        return f"{gender}.65+"
+    return f"{gender}.{age}"
 
 
 def _normalize_scalar_value(raw_value: Any) -> int:
@@ -635,6 +698,13 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     video_age_gender = metrics.get("post_video_views_3s_by_age_bucket_and_gender", {})
     if isinstance(video_age_gender, dict):
+        normalized_breakdown: Dict[str, int] = {}
+        for raw_key, raw_value in video_age_gender.items():
+            normalized_key = _normalize_age_gender_key(raw_key)
+            if not normalized_key:
+                continue
+            normalized_breakdown[normalized_key] = normalized_breakdown.get(normalized_key, 0) + _safe_int(raw_value)
+
         mapping = {
             "M.18-24": "3s_views_M_18_24",
             "M.25-34": "3s_views_M_25_34",
@@ -650,7 +720,7 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
             "F.65+": "3s_views_F_65_plus",
         }
         for src_key, out_key in mapping.items():
-            result[out_key] = _safe_int(video_age_gender.get(src_key, 0))
+            result[out_key] = _safe_int(normalized_breakdown.get(src_key, 0))
 
     return result
 
