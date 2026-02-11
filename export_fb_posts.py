@@ -102,6 +102,7 @@ INSIGHT_METRICS_CANDIDATES = [
     "post_video_complete_views_30s_organic",
     "post_video_complete_views_30s_paid",
     "post_video_views_3s_by_age_bucket_and_gender",
+    "post_impressions_by_age_and_gender_unique",
 ]
 
 VIDEO_3S_METRIC_PRIORITY = [
@@ -149,18 +150,18 @@ CSV_COLUMNS = [
     "1-minute video views",
     "Seconds viewed (video view time)",
     "Average seconds viewed (video avg time watched)",
-    "3s_views_M_18_24",
-    "3s_views_M_25_34",
-    "3s_views_M_35_44",
-    "3s_views_M_45_54",
-    "3s_views_M_55_64",
-    "3s_views_M_65_plus",
-    "3s_views_F_18_24",
-    "3s_views_F_25_34",
-    "3s_views_F_35_44",
-    "3s_views_F_45_54",
-    "3s_views_F_55_64",
-    "3s_views_F_65_plus",
+    "reach_M_18_24",
+    "reach_M_25_34",
+    "reach_M_35_44",
+    "reach_M_45_54",
+    "reach_M_55_64",
+    "reach_M_65_plus",
+    "reach_F_18_24",
+    "reach_F_25_34",
+    "reach_F_35_44",
+    "reach_F_45_54",
+    "reach_F_55_64",
+    "reach_F_65_plus",
 ]
 
 BASE_COLUMNS = {
@@ -560,6 +561,7 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
         "post_reactions_by_type_total",
         "post_clicks_by_type",
         "post_video_views_3s_by_age_bucket_and_gender",
+        "post_impressions_by_age_and_gender_unique",
     }
 
     metrics: Dict[str, Any] = {}
@@ -706,42 +708,46 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
         metrics.get("post_video_avg_time_watched", 0)
     )
 
-    video_age_gender = metrics.get("post_video_views_3s_by_age_bucket_and_gender", {})
-    if isinstance(video_age_gender, dict):
+    reach_age_gender = metrics.get("post_impressions_by_age_and_gender_unique", {})
+    if not isinstance(reach_age_gender, dict) or not reach_age_gender:
+        # Fallback to previous 3s video breakdown only when reach breakdown is unavailable.
+        reach_age_gender = metrics.get("post_video_views_3s_by_age_bucket_and_gender", {})
+
+    if isinstance(reach_age_gender, dict):
         normalized_breakdown: Dict[str, int] = {}
-        for raw_key, raw_value in video_age_gender.items():
+        for raw_key, raw_value in reach_age_gender.items():
             normalized_key = _normalize_age_gender_key(raw_key)
             if not normalized_key:
                 logging.debug(
-                    "Unable to map age/gender key '%s' from post_video_views_3s_by_age_bucket_and_gender.",
+                    "Unable to map age/gender key '%s' from reach age/gender breakdown metric.",
                     raw_key,
                 )
                 continue
             normalized_breakdown[normalized_key] = normalized_breakdown.get(normalized_key, 0) + _safe_int(raw_value)
 
         if _DEBUG_ENABLED:
-            logging.debug("Normalized 3s age/gender breakdown: %s", normalized_breakdown)
+            logging.debug("Normalized reach age/gender breakdown: %s", normalized_breakdown)
 
         mapping = {
-            "M.18-24": "3s_views_M_18_24",
-            "M.25-34": "3s_views_M_25_34",
-            "M.35-44": "3s_views_M_35_44",
-            "M.45-54": "3s_views_M_45_54",
-            "M.55-64": "3s_views_M_55_64",
-            "M.65+": "3s_views_M_65_plus",
-            "F.18-24": "3s_views_F_18_24",
-            "F.25-34": "3s_views_F_25_34",
-            "F.35-44": "3s_views_F_35_44",
-            "F.45-54": "3s_views_F_45_54",
-            "F.55-64": "3s_views_F_55_64",
-            "F.65+": "3s_views_F_65_plus",
+            "M.18-24": "reach_M_18_24",
+            "M.25-34": "reach_M_25_34",
+            "M.35-44": "reach_M_35_44",
+            "M.45-54": "reach_M_45_54",
+            "M.55-64": "reach_M_55_64",
+            "M.65+": "reach_M_65_plus",
+            "F.18-24": "reach_F_18_24",
+            "F.25-34": "reach_F_25_34",
+            "F.35-44": "reach_F_35_44",
+            "F.45-54": "reach_F_45_54",
+            "F.55-64": "reach_F_55_64",
+            "F.65+": "reach_F_65_plus",
         }
         for src_key, out_key in mapping.items():
             result[out_key] = _safe_int(normalized_breakdown.get(src_key, 0))
     elif _DEBUG_ENABLED:
         logging.debug(
-            "Expected dict for post_video_views_3s_by_age_bucket_and_gender but got %s",
-            type(video_age_gender).__name__,
+            "Expected dict for post_impressions_by_age_and_gender_unique/post_video_views_3s_by_age_bucket_and_gender but got %s",
+            type(reach_age_gender).__name__,
         )
 
     return result
@@ -1054,3 +1060,4 @@ if __name__ == "__main__":
     except Exception as exc:
         logging.exception("Unexpected unhandled error: %s", exc)
         raise SystemExit(1)
+
