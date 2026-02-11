@@ -469,9 +469,22 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
             break
 
     result["Impressions"] = _safe_int(impressions)
-    result["Impressions (Unique)"] = _safe_int(metrics.get("post_impressions_unique", 0))
-    result["Impressions (Organic)"] = _safe_int(metrics.get("post_impressions_organic", 0))
-    result["Impressions (Paid/Boosted)"] = _safe_int(metrics.get("post_impressions_paid", 0))
+
+    impressions_organic = _safe_int(metrics.get("post_impressions_organic", 0))
+    if impressions_organic <= 0:
+        impressions_organic = _safe_int(metrics.get("post_impressions_organic_unique", 0))
+
+    impressions_paid = _safe_int(metrics.get("post_impressions_paid", 0))
+    if impressions_paid <= 0:
+        impressions_paid = _safe_int(metrics.get("post_impressions_paid_unique", 0))
+
+    impressions_unique = _safe_int(metrics.get("post_impressions_unique", 0))
+    if impressions_unique <= 0 and (impressions_organic > 0 or impressions_paid > 0):
+        impressions_unique = impressions_organic + impressions_paid
+
+    result["Impressions (Unique)"] = impressions_unique
+    result["Impressions (Organic)"] = impressions_organic
+    result["Impressions (Paid/Boosted)"] = impressions_paid
 
     reach_organic = _safe_int(metrics.get("post_reach_organic", 0))
     if reach_organic <= 0:
@@ -501,7 +514,15 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
     result["Reach"] = reach_total
     result["Reach (Organic)"] = reach_organic
     result["Reach (Paid/Boosted)"] = reach_paid
-    result["Engaged users"] = _safe_int(metrics.get("post_engaged_users", 0))
+    engaged_users = _safe_int(metrics.get("post_engaged_users", 0))
+    if engaged_users <= 0:
+        engaged_users = _safe_int(metrics.get("post_clicks_unique", 0))
+    if engaged_users <= 0:
+        engaged_users = max(
+            _safe_int(metrics.get("post_clicks", 0)),
+            _safe_int(metrics.get("post_comments", 0)) + _safe_int(metrics.get("post_shares", 0)),
+        )
+    result["Engaged users"] = engaged_users
     result["Comments"] = _safe_int(metrics.get("post_comments", 0))
     result["Shares"] = _safe_int(metrics.get("post_shares", 0))
     result["Negative feedback"] = _safe_int(metrics.get("post_negative_feedback", 0))
