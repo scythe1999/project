@@ -385,6 +385,49 @@ def _value_from_insight(item: Dict[str, Any]) -> Any:
     return first.get("value", 0)
 
 
+def _normalize_breakdown_value(raw_value: Any) -> Dict[str, Any]:
+    """Normalize Graph API breakdown payloads to a flat dict shape."""
+    if isinstance(raw_value, dict):
+        if "value" in raw_value and isinstance(raw_value["value"], dict):
+            return raw_value["value"]
+        if "total_value" in raw_value and isinstance(raw_value["total_value"], dict):
+            nested_total = raw_value["total_value"]
+            if "value" in nested_total and isinstance(nested_total["value"], dict):
+                return nested_total["value"]
+            return nested_total
+        return raw_value
+    return {}
+
+
+def _normalize_scalar_value(raw_value: Any) -> int:
+    """Normalize scalar insight values across Graph API response variants."""
+    if isinstance(raw_value, (int, float, str)):
+        return _safe_int(raw_value)
+
+    if isinstance(raw_value, dict):
+        # Common wrappers observed across Graph versions.
+        for key in ("value", "total_value", "count", "total", "sum"):
+            if key in raw_value:
+                normalized = _normalize_scalar_value(raw_value[key])
+                if normalized:
+                    return normalized
+
+        # If a dict has only numeric values, sum them as a fallback.
+        numeric_values = [_safe_int(v) for v in raw_value.values()]
+        if any(numeric_values):
+            return int(sum(numeric_values))
+
+    if isinstance(raw_value, list):
+        # Keep best non-zero number in case Graph returns a short series.
+        numeric_values = [_normalize_scalar_value(v) for v in raw_value]
+        non_zero = [v for v in numeric_values if v > 0]
+        if non_zero:
+            return max(non_zero)
+        return 0
+
+    return 0
+
+
 def _zero_insights() -> Dict[str, Any]:
     return {col: 0 for col in CSV_COLUMNS if col not in BASE_COLUMNS}
 
@@ -393,12 +436,22 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
     result = _zero_insights()
     items = payload.get("data", [])
 
+    breakdown_metrics = {
+        "post_reactions_by_type_total",
+        "post_clicks_by_type",
+        "post_video_views_3s_by_age_bucket_and_gender",
+    }
+
     metrics: Dict[str, Any] = {}
     for item in items:
         name = item.get("name")
         if not name:
             continue
-        metrics[name] = _value_from_insight(item)
+        raw_value = _value_from_insight(item)
+        if name in breakdown_metrics:
+            metrics[name] = _normalize_breakdown_value(raw_value)
+        else:
+            metrics[name] = _normalize_scalar_value(raw_value)
 
     impression_fallback_metric_names = [
         "post_impressions",
