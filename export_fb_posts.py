@@ -63,6 +63,19 @@ POST_FIELDS_CANDIDATES = [
 ]
 
 INSIGHT_METRICS_CANDIDATES = [
+    "post_reach",
+    "post_reach_organic",
+    "post_reach_paid",
+    "post_impressions",
+    "post_impressions_organic",
+    "post_impressions_paid",
+    "post_impressions_organic_unique",
+    "post_impressions_paid_unique",
+    "post_engaged_users",
+    "post_comments",
+    "post_shares",
+    "post_negative_feedback",
+    "post_negative_feedback_unique",
     "post_impressions_unique",
     "post_media_view",
     "post_media_views",
@@ -406,9 +419,35 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
     result["Impressions (Unique)"] = _safe_int(metrics.get("post_impressions_unique", 0))
     result["Impressions (Organic)"] = _safe_int(metrics.get("post_impressions_organic", 0))
     result["Impressions (Paid/Boosted)"] = _safe_int(metrics.get("post_impressions_paid", 0))
-    result["Reach"] = _safe_int(metrics.get("post_reach", 0))
-    result["Reach (Organic)"] = _safe_int(metrics.get("post_reach_organic", 0))
-    result["Reach (Paid/Boosted)"] = _safe_int(metrics.get("post_reach_paid", 0))
+
+    reach_organic = _safe_int(metrics.get("post_reach_organic", 0))
+    if reach_organic <= 0:
+        reach_organic = _safe_int(metrics.get("post_impressions_organic_unique", 0))
+    if reach_organic <= 0:
+        reach_organic = _safe_int(metrics.get("post_impressions_organic", 0))
+
+    reach_paid = _safe_int(metrics.get("post_reach_paid", 0))
+    if reach_paid <= 0:
+        reach_paid = _safe_int(metrics.get("post_impressions_paid_unique", 0))
+    if reach_paid <= 0:
+        reach_paid = _safe_int(metrics.get("post_impressions_paid", 0))
+
+    reach_total = _safe_int(metrics.get("post_reach", 0))
+    if reach_total <= 0:
+        reach_total = _safe_int(metrics.get("post_impressions_unique", 0))
+    if reach_total <= 0 and (reach_organic > 0 or reach_paid > 0):
+        reach_total = reach_organic + reach_paid
+    if reach_total <= 0:
+        reach_total = _safe_int(result.get("Impressions", 0))
+
+    if reach_total > 0 and reach_organic > 0 and reach_paid <= 0:
+        reach_paid = max(0, reach_total - reach_organic)
+    if reach_total > 0 and reach_paid > 0 and reach_organic <= 0:
+        reach_organic = max(0, reach_total - reach_paid)
+
+    result["Reach"] = reach_total
+    result["Reach (Organic)"] = reach_organic
+    result["Reach (Paid/Boosted)"] = reach_paid
     result["Engaged users"] = _safe_int(metrics.get("post_engaged_users", 0))
     result["Comments"] = _safe_int(metrics.get("post_comments", 0))
     result["Shares"] = _safe_int(metrics.get("post_shares", 0))
