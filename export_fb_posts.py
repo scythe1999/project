@@ -463,6 +463,11 @@ def _first_positive_metric(metrics: Dict[str, Any], metric_names: List[str]) -> 
     return 0
 
 
+def _sum_metrics(metrics: Dict[str, Any], metric_names: List[str]) -> int:
+    """Return the sum of metrics for scenarios where Graph splits one KPI into multiple fields."""
+    return int(sum(_safe_int(metrics.get(metric_name, 0)) for metric_name in metric_names))
+
+
 def _extract_post_counter(post: Dict[str, Any], key: str) -> int:
     """Best-effort extraction for counters returned directly on /posts edge."""
     raw_value = post.get(key)
@@ -599,15 +604,27 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     three_second_views = _first_positive_metric(metrics, VIDEO_3S_METRIC_PRIORITY)
     if three_second_views <= 0:
+        three_second_views = _sum_metrics(
+            metrics,
+            ["post_video_views_3s_clicked_to_play", "post_video_views_3s_autoplayed"],
+        )
+    if three_second_views <= 0:
         video_age_gender = metrics.get("post_video_views_3s_by_age_bucket_and_gender", {})
         if isinstance(video_age_gender, dict):
             three_second_views = int(sum(_safe_int(v) for v in video_age_gender.values()))
+    if three_second_views <= 0:
+        # Backward-compatible fallback in cases where Graph exposes only aggregate video views.
+        three_second_views = _safe_int(metrics.get("post_video_views", 0))
 
     one_minute_views = _first_positive_metric(metrics, VIDEO_1M_METRIC_PRIORITY)
     if one_minute_views <= 0:
         one_minute_views = _safe_int(metrics.get("post_video_complete_views_30s_organic", 0)) + _safe_int(
             metrics.get("post_video_complete_views_30s_paid", 0)
         )
+
+    # 1-minute views are a strict subset of 3-second views; keep values logically consistent.
+    if one_minute_views > 0 and three_second_views < one_minute_views:
+        three_second_views = one_minute_views
 
     result["3-second video views"] = three_second_views
     result["1-minute video views"] = one_minute_views
