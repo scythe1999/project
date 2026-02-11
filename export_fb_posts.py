@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import random
-import re
 import time
 import argparse
 from typing import Any, Dict, List, Optional, Set
@@ -101,8 +100,9 @@ INSIGHT_METRICS_CANDIDATES = [
     "post_video_complete_views_30s",
     "post_video_complete_views_30s_organic",
     "post_video_complete_views_30s_paid",
-    "post_video_views_3s_by_age_bucket_and_gender",
-    "post_impressions_by_age_and_gender_unique",
+    "post_spend",
+    "post_total_spend",
+    "post_amount_spent",
 ]
 
 VIDEO_3S_METRIC_PRIORITY = [
@@ -115,6 +115,12 @@ VIDEO_1M_METRIC_PRIORITY = [
     "post_video_views_1m",
     "post_video_views_60s_excludes_shorter_views",
     "post_video_complete_views_30s",
+]
+
+SPEND_METRIC_PRIORITY = [
+    "post_spend",
+    "post_total_spend",
+    "post_amount_spent",
 ]
 
 CSV_COLUMNS = [
@@ -150,18 +156,7 @@ CSV_COLUMNS = [
     "1-minute video views",
     "Seconds viewed (video view time)",
     "Average seconds viewed (video avg time watched)",
-    "reach_M_18_24",
-    "reach_M_25_34",
-    "reach_M_35_44",
-    "reach_M_45_54",
-    "reach_M_55_64",
-    "reach_M_65_plus",
-    "reach_F_18_24",
-    "reach_F_25_34",
-    "reach_F_35_44",
-    "reach_F_45_54",
-    "reach_F_55_64",
-    "reach_F_65_plus",
+    "Spent per post",
 ]
 
 BASE_COLUMNS = {
@@ -417,20 +412,46 @@ def _value_from_insight(item: Dict[str, Any]) -> Any:
 
 def _normalize_breakdown_value(raw_value: Any) -> Dict[str, Any]:
     """Normalize Graph API breakdown payloads to a flat dict shape."""
+    if isinstance(raw_value, dict):
+        if "value" in raw_value and isinstance(raw_value["value"], dict):
+            return raw_value["value"]
+        if "total_value" in raw_value and isinstance(raw_value["total_value"], dict):
+            nested_total = raw_value["total_value"]
+            if "value" in nested_total and isinstance(nested_total["value"], dict):
+                return nested_total["value"]
+            if "breakdowns" in nested_total:
+                return _normalize_breakdown_value(nested_total["breakdowns"])
+            return {str(key): _safe_int(value) for key, value in nested_total.items()}
+        if "breakdowns" in raw_value:
+            return _normalize_breakdown_value(raw_value["breakdowns"])
+        if "results" in raw_value and isinstance(raw_value["results"], list):
+            normalized: Dict[str, Any] = {}
+            for result in raw_value["results"]:
+                if not isinstance(result, dict):
+                    continue
+                key = str(result.get("key") or result.get("name") or "").strip()
+                if not key:
+                    dimensions = result.get("dimension_values")
+                    if isinstance(dimensions, list) and dimensions:
+                        key = ".".join(str(part).strip() for part in dimensions if str(part).strip())
+                if not key:
+                    continue
+                normalized[key] = normalized.get(key, 0) + _safe_int(result.get("value", 0))
+            if normalized:
+                return normalized
+        if "data" in raw_value and isinstance(raw_value["data"], list):
+            normalized_data = _normalize_breakdown_value(raw_value["data"])
+            if normalized_data:
+                return normalized_data
+        return {str(key): _safe_int(value) for key, value in raw_value.items()}
+
     if isinstance(raw_value, list):
         merged: Dict[str, Any] = {}
         for item in raw_value:
-            if isinstance(item, dict):
-                # Some Graph responses return list rows as {"key": "M.18-24", "value": 12}
-                # or {"dimension_values": [...], "value": 12} instead of a direct dict map.
-                list_key = None
-                if "key" in item:
-                    list_key = _normalize_age_gender_key(item.get("key"))
-                elif "dimension_values" in item:
-                    list_key = _normalize_age_gender_from_dimensions(item.get("dimension_values"))
-
-                if list_key:
-                    merged[list_key] = merged.get(list_key, 0) + _safe_int(item.get("value", 0))
+            if isinstance(item, dict) and "key" in item and "value" in item:
+                key = str(item.get("key") or "").strip()
+                if key:
+                    merged[key] = merged.get(key, 0) + _safe_int(item.get("value", 0))
                     continue
 
             normalized = _normalize_breakdown_value(item)
@@ -440,82 +461,7 @@ def _normalize_breakdown_value(raw_value: Any) -> Dict[str, Any]:
                 merged[key] = _safe_int(merged.get(key, 0)) + _safe_int(value)
         return merged
 
-    if isinstance(raw_value, dict):
-        if "key" in raw_value and "value" in raw_value:
-            normalized_key = _normalize_age_gender_key(raw_value.get("key"))
-            if normalized_key:
-                return {normalized_key: _safe_int(raw_value.get("value", 0))}
-
-        if "value" in raw_value and isinstance(raw_value["value"], dict):
-            return raw_value["value"]
-        if "total_value" in raw_value and isinstance(raw_value["total_value"], dict):
-            nested_total = raw_value["total_value"]
-            if "value" in nested_total and isinstance(nested_total["value"], dict):
-                return nested_total["value"]
-            if "breakdowns" in nested_total:
-                return _normalize_breakdown_value(nested_total["breakdowns"])
-            return nested_total
-        if "breakdowns" in raw_value:
-            return _normalize_breakdown_value(raw_value["breakdowns"])
-        if "results" in raw_value and isinstance(raw_value["results"], list):
-            normalized: Dict[str, Any] = {}
-            for result in raw_value["results"]:
-                if not isinstance(result, dict):
-                    continue
-                dimensions = result.get("dimension_values", [])
-                value = _safe_int(result.get("value", 0))
-                normalized_key = _normalize_age_gender_from_dimensions(dimensions)
-                if not normalized_key:
-                    if _DEBUG_ENABLED:
-                        logging.debug(
-                            "Skipping unrecognized age/gender dimensions: %s",
-                            dimensions,
-                        )
-                    continue
-                normalized[normalized_key] = normalized.get(normalized_key, 0) + value
-            if normalized:
-                return normalized
-
-        if "data" in raw_value and isinstance(raw_value["data"], list):
-            normalized_data = _normalize_breakdown_value(raw_value["data"])
-            if normalized_data:
-                return normalized_data
-        return raw_value
     return {}
-
-
-def _normalize_age_gender_key(raw_key: Any) -> Optional[str]:
-    key = str(raw_key or "").strip()
-    if not key:
-        return None
-
-    key_upper = key.upper().replace("_", ".")
-    key_upper = re.sub(r"\s+", "", key_upper)
-    match = re.search(r"\b(M|F|MALE|FEMALE)\b", key_upper)
-    age_match = re.search(r"(18[-.]?24|25[-.]?34|35[-.]?44|45[-.]?54|55[-.]?64|65\+)", key_upper)
-    if not match or not age_match:
-        return None
-
-    gender_token = match.group(1)
-    gender = "M" if gender_token in {"M", "MALE"} else "F"
-    age = age_match.group(1).replace(".", "-")
-    if age == "65+":
-        return f"{gender}.65+"
-    return f"{gender}.{age}"
-
-
-def _normalize_age_gender_from_dimensions(raw_dimensions: Any) -> Optional[str]:
-    """Normalize age+gender values from Graph breakdown dimension arrays."""
-    if not isinstance(raw_dimensions, list) or not raw_dimensions:
-        return None
-
-    cleaned_parts = [str(part or "").strip() for part in raw_dimensions if str(part or "").strip()]
-    if not cleaned_parts:
-        return None
-
-    # Graph can return either ["18-24", "female"] or ["female", "18-24"] depending on version/metric.
-    combined = ".".join(cleaned_parts)
-    return _normalize_age_gender_key(combined)
 
 
 def _normalize_scalar_value(raw_value: Any) -> int:
@@ -545,6 +491,39 @@ def _normalize_scalar_value(raw_value: Any) -> int:
         return 0
 
     return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_currency_value(raw_value: Any) -> float:
+    """Normalize currency-like insight values across Graph API response variants."""
+    if isinstance(raw_value, (int, float, str)):
+        return _safe_float(raw_value)
+
+    if isinstance(raw_value, dict):
+        for key in ("value", "total_value", "amount", "sum", "total"):
+            if key in raw_value:
+                normalized = _normalize_currency_value(raw_value[key])
+                if normalized > 0:
+                    return normalized
+
+        numeric_values = [_safe_float(v) for v in raw_value.values()]
+        if any(numeric_values):
+            return float(sum(numeric_values))
+
+    if isinstance(raw_value, list):
+        numeric_values = [_normalize_currency_value(v) for v in raw_value]
+        non_zero = [v for v in numeric_values if v > 0]
+        if non_zero:
+            return max(non_zero)
+        return 0.0
+
+    return 0.0
 
 
 def _zero_insights() -> Dict[str, Any]:
@@ -583,8 +562,6 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
     breakdown_metrics = {
         "post_reactions_by_type_total",
         "post_clicks_by_type",
-        "post_video_views_3s_by_age_bucket_and_gender",
-        "post_impressions_by_age_and_gender_unique",
     }
 
     metrics: Dict[str, Any] = {}
@@ -593,7 +570,9 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not name:
             continue
         raw_value = _value_from_insight(item)
-        if name in breakdown_metrics:
+        if name in SPEND_METRIC_PRIORITY:
+            metrics[name] = _normalize_currency_value(raw_value)
+        elif name in breakdown_metrics:
             metrics[name] = _normalize_breakdown_value(raw_value)
         else:
             metrics[name] = _normalize_scalar_value(raw_value)
@@ -707,10 +686,6 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
             ["post_video_views_3s_clicked_to_play", "post_video_views_3s_autoplayed"],
         )
     if three_second_views <= 0:
-        video_age_gender = metrics.get("post_video_views_3s_by_age_bucket_and_gender", {})
-        if isinstance(video_age_gender, dict):
-            three_second_views = int(sum(_safe_int(v) for v in video_age_gender.values()))
-    if three_second_views <= 0:
         # Backward-compatible fallback in cases where Graph exposes only aggregate video views.
         three_second_views = _safe_int(metrics.get("post_video_views", 0))
 
@@ -731,47 +706,10 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
         metrics.get("post_video_avg_time_watched", 0)
     )
 
-    reach_age_gender = metrics.get("post_impressions_by_age_and_gender_unique", {})
-    if not isinstance(reach_age_gender, dict) or not reach_age_gender:
-        # Fallback to previous 3s video breakdown only when reach breakdown is unavailable.
-        reach_age_gender = metrics.get("post_video_views_3s_by_age_bucket_and_gender", {})
-
-    if isinstance(reach_age_gender, dict):
-        normalized_breakdown: Dict[str, int] = {}
-        for raw_key, raw_value in reach_age_gender.items():
-            normalized_key = _normalize_age_gender_key(raw_key)
-            if not normalized_key:
-                logging.debug(
-                    "Unable to map age/gender key '%s' from reach age/gender breakdown metric.",
-                    raw_key,
-                )
-                continue
-            normalized_breakdown[normalized_key] = normalized_breakdown.get(normalized_key, 0) + _safe_int(raw_value)
-
-        if _DEBUG_ENABLED:
-            logging.debug("Normalized reach age/gender breakdown: %s", normalized_breakdown)
-
-        mapping = {
-            "M.18-24": "reach_M_18_24",
-            "M.25-34": "reach_M_25_34",
-            "M.35-44": "reach_M_35_44",
-            "M.45-54": "reach_M_45_54",
-            "M.55-64": "reach_M_55_64",
-            "M.65+": "reach_M_65_plus",
-            "F.18-24": "reach_F_18_24",
-            "F.25-34": "reach_F_25_34",
-            "F.35-44": "reach_F_35_44",
-            "F.45-54": "reach_F_45_54",
-            "F.55-64": "reach_F_55_64",
-            "F.65+": "reach_F_65_plus",
-        }
-        for src_key, out_key in mapping.items():
-            result[out_key] = _safe_int(normalized_breakdown.get(src_key, 0))
-    elif _DEBUG_ENABLED:
-        logging.debug(
-            "Expected dict for post_impressions_by_age_and_gender_unique/post_video_views_3s_by_age_bucket_and_gender but got %s",
-            type(reach_age_gender).__name__,
-        )
+    for metric_name in SPEND_METRIC_PRIORITY:
+        if metric_name in metrics:
+            result["Spent per post"] = round(_safe_float(metrics.get(metric_name, 0.0)), 2)
+            break
 
     return result
 
@@ -1083,4 +1021,3 @@ if __name__ == "__main__":
     except Exception as exc:
         logging.exception("Unexpected unhandled error: %s", exc)
         raise SystemExit(1)
-
