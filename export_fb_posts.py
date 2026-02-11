@@ -94,7 +94,25 @@ INSIGHT_METRICS_CANDIDATES = [
     "post_video_avg_time_watched",
     "post_video_views_3s",
     "post_video_views_1m",
+    "post_video_views_3s_clicked_to_play",
+    "post_video_views_3s_autoplayed",
+    "post_video_views_60s_excludes_shorter_views",
+    "post_video_complete_views_30s",
+    "post_video_complete_views_30s_organic",
+    "post_video_complete_views_30s_paid",
     "post_video_views_3s_by_age_bucket_and_gender",
+]
+
+VIDEO_3S_METRIC_PRIORITY = [
+    "post_video_views_3s",
+    "post_video_views_3s_clicked_to_play",
+    "post_video_views_3s_autoplayed",
+]
+
+VIDEO_1M_METRIC_PRIORITY = [
+    "post_video_views_1m",
+    "post_video_views_60s_excludes_shorter_views",
+    "post_video_complete_views_30s",
 ]
 
 CSV_COLUMNS = [
@@ -436,6 +454,15 @@ def _zero_insights() -> Dict[str, Any]:
     return {col: 0 for col in CSV_COLUMNS if col not in BASE_COLUMNS}
 
 
+def _first_positive_metric(metrics: Dict[str, Any], metric_names: List[str]) -> int:
+    """Return first positive metric value from a prioritized list of metric names."""
+    for metric_name in metric_names:
+        value = _safe_int(metrics.get(metric_name, 0))
+        if value > 0:
+            return value
+    return 0
+
+
 def _extract_post_counter(post: Dict[str, Any], key: str) -> int:
     """Best-effort extraction for counters returned directly on /posts edge."""
     raw_value = post.get(key)
@@ -570,8 +597,20 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
     result["Link Clicks"] = link_clicks
     result["Other Clicks"] = other_clicks
 
-    result["3-second video views"] = _safe_int(metrics.get("post_video_views_3s", 0))
-    result["1-minute video views"] = _safe_int(metrics.get("post_video_views_1m", 0))
+    three_second_views = _first_positive_metric(metrics, VIDEO_3S_METRIC_PRIORITY)
+    if three_second_views <= 0:
+        video_age_gender = metrics.get("post_video_views_3s_by_age_bucket_and_gender", {})
+        if isinstance(video_age_gender, dict):
+            three_second_views = int(sum(_safe_int(v) for v in video_age_gender.values()))
+
+    one_minute_views = _first_positive_metric(metrics, VIDEO_1M_METRIC_PRIORITY)
+    if one_minute_views <= 0:
+        one_minute_views = _safe_int(metrics.get("post_video_complete_views_30s_organic", 0)) + _safe_int(
+            metrics.get("post_video_complete_views_30s_paid", 0)
+        )
+
+    result["3-second video views"] = three_second_views
+    result["1-minute video views"] = one_minute_views
     result["Seconds viewed (video view time)"] = _safe_int(metrics.get("post_video_view_time", 0))
     result["Average seconds viewed (video avg time watched)"] = _safe_int(
         metrics.get("post_video_avg_time_watched", 0)
