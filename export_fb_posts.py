@@ -13,7 +13,6 @@ Notes:
 - This script discovers valid metrics once per run and skips unsupported metrics safely.
 """
 
-import csv
 import datetime
 import json
 import logging
@@ -24,18 +23,20 @@ import argparse
 from typing import Any, Dict, List, Optional, Set
 
 import requests
+from openpyxl import Workbook
 
 # =========================
 # Configuration
 # =========================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 GRAPH_VERSION = "v23.0"
 PAGE_ID = "101275806400438"
 ACCESS_TOKEN_PLACEHOLDER = "<ACCESS_TOKEN>"
 ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", ACCESS_TOKEN_PLACEHOLDER)
 SINCE = "2026-01-01"  # YYYY-MM-DD
 UNTIL = "2026-01-31"  # YYYY-MM-DD
-OUTPUT_FILE = "fb_page_posts_report.csv"
-METRICS_DEBUG_FILE = "metrics_debug.json"
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, "fb_page_posts_report.xlsx")
+METRICS_DEBUG_FILE = os.path.join(SCRIPT_DIR, "metrics_debug.json")
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_RETRIES = 6
 BASE_BACKOFF_SECONDS = 2
@@ -161,7 +162,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--until", default=UNTIL, help="End date YYYY-MM-DD")
     parser.add_argument("--page-id", default=PAGE_ID, help="Facebook Page ID")
     parser.add_argument("--graph-version", default=GRAPH_VERSION, help="Graph API version")
-    parser.add_argument("--output", default=OUTPUT_FILE, help="CSV output file path")
+    parser.add_argument("--output", default=OUTPUT_FILE, help="XLSX output file path")
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -670,11 +671,16 @@ def build_rows(posts: List[Dict[str, Any]], page_name: str) -> List[Dict[str, An
     return rows
 
 
-def write_csv(rows: List[Dict[str, Any]]) -> None:
-    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+def write_xlsx(rows: List[Dict[str, Any]]) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "FB Posts"
+
+    worksheet.append(CSV_COLUMNS)
+    for row in rows:
+        worksheet.append([row.get(column, "") for column in CSV_COLUMNS])
+
+    workbook.save(OUTPUT_FILE)
 
 
 def write_metrics_debug() -> None:
@@ -737,7 +743,7 @@ def main() -> None:
         return
 
     rows = build_rows(posts, page_name)
-    write_csv(rows)
+    write_xlsx(rows)
     print_metric_summary()
 
     if _DEBUG_ENABLED:
