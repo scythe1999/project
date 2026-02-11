@@ -445,19 +445,15 @@ def _normalize_breakdown_value(raw_value: Any) -> Dict[str, Any]:
                     continue
                 dimensions = result.get("dimension_values", [])
                 value = _safe_int(result.get("value", 0))
-                if not isinstance(dimensions, list) or len(dimensions) < 2:
+                normalized_key = _normalize_age_gender_from_dimensions(dimensions)
+                if not normalized_key:
+                    if _DEBUG_ENABLED:
+                        logging.debug(
+                            "Skipping unrecognized age/gender dimensions: %s",
+                            dimensions,
+                        )
                     continue
-                age_bucket = str(dimensions[0]).strip()
-                gender_raw = str(dimensions[1]).strip().upper()
-                if gender_raw in {"MALE", "MAN", "BOY"}:
-                    gender = "M"
-                elif gender_raw in {"FEMALE", "WOMAN", "GIRL"}:
-                    gender = "F"
-                else:
-                    gender = gender_raw
-                if not age_bucket or gender not in {"M", "F"}:
-                    continue
-                normalized[f"{gender}.{age_bucket}"] = normalized.get(f"{gender}.{age_bucket}", 0) + value
+                normalized[normalized_key] = normalized.get(normalized_key, 0) + value
             if normalized:
                 return normalized
         return raw_value
@@ -482,6 +478,20 @@ def _normalize_age_gender_key(raw_key: Any) -> Optional[str]:
     if age == "65+":
         return f"{gender}.65+"
     return f"{gender}.{age}"
+
+
+def _normalize_age_gender_from_dimensions(raw_dimensions: Any) -> Optional[str]:
+    """Normalize age+gender values from Graph breakdown dimension arrays."""
+    if not isinstance(raw_dimensions, list) or not raw_dimensions:
+        return None
+
+    cleaned_parts = [str(part or "").strip() for part in raw_dimensions if str(part or "").strip()]
+    if not cleaned_parts:
+        return None
+
+    # Graph can return either ["18-24", "female"] or ["female", "18-24"] depending on version/metric.
+    combined = ".".join(cleaned_parts)
+    return _normalize_age_gender_key(combined)
 
 
 def _normalize_scalar_value(raw_value: Any) -> int:
@@ -702,8 +712,15 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
         for raw_key, raw_value in video_age_gender.items():
             normalized_key = _normalize_age_gender_key(raw_key)
             if not normalized_key:
+                logging.debug(
+                    "Unable to map age/gender key '%s' from post_video_views_3s_by_age_bucket_and_gender.",
+                    raw_key,
+                )
                 continue
             normalized_breakdown[normalized_key] = normalized_breakdown.get(normalized_key, 0) + _safe_int(raw_value)
+
+        if _DEBUG_ENABLED:
+            logging.debug("Normalized 3s age/gender breakdown: %s", normalized_breakdown)
 
         mapping = {
             "M.18-24": "3s_views_M_18_24",
@@ -721,6 +738,11 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
         for src_key, out_key in mapping.items():
             result[out_key] = _safe_int(normalized_breakdown.get(src_key, 0))
+    elif _DEBUG_ENABLED:
+        logging.debug(
+            "Expected dict for post_video_views_3s_by_age_bucket_and_gender but got %s",
+            type(video_age_gender).__name__,
+        )
 
     return result
 
@@ -841,6 +863,12 @@ def fetch_post_insights(post_id: str, valid_metrics: List[str], group_key: str) 
 
             invalid_name = _extract_invalid_metric_name(str(exc))
             if invalid_name and invalid_name in metrics_to_request:
+                logging.debug(
+                    "Removing invalid metric '%s' for group '%s' while fetching post %s.",
+                    invalid_name,
+                    group_key,
+                    post_id,
+                )
                 metrics_to_request.remove(invalid_name)
                 cached = _METRIC_DISCOVERY_CACHE.get(group_key, [])
                 _METRIC_DISCOVERY_CACHE[group_key] = [m for m in cached if m != invalid_name]
