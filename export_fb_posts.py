@@ -52,6 +52,10 @@ INVALID_METRIC_CODE = 100
 INVALID_QUERY_CODE = 3001
 
 POST_FIELDS_CANDIDATES = [
+    # Include public engagement counters when available.
+    "id,created_time,permalink_url,message,status_type,shares,comments.limit(0).summary(true)",
+    "id,created_time,permalink_url,message,story,status_type,shares,comments.limit(0).summary(true)",
+    "id,created_time,permalink_url,message,story,status_type,type,shares,comments.limit(0).summary(true)",
     # Stable minimal baseline first.
     "id,created_time,permalink_url,message,status_type",
     # Fallback with story if message-only payload is constrained.
@@ -432,6 +436,17 @@ def _zero_insights() -> Dict[str, Any]:
     return {col: 0 for col in CSV_COLUMNS if col not in BASE_COLUMNS}
 
 
+def _extract_post_counter(post: Dict[str, Any], key: str) -> int:
+    """Best-effort extraction for counters returned directly on /posts edge."""
+    raw_value = post.get(key)
+    if key == "comments" and isinstance(raw_value, dict):
+        summary = raw_value.get("summary", {})
+        return _safe_int(summary.get("total_count", 0))
+    if key == "shares" and isinstance(raw_value, dict):
+        return _safe_int(raw_value.get("count", 0))
+    return _safe_int(raw_value)
+
+
 def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
     result = _zero_insights()
     items = payload.get("data", [])
@@ -770,6 +785,13 @@ def build_rows(posts: List[Dict[str, Any]], page_name: str) -> List[Dict[str, An
                 exc,
             )
             insights = _zero_insights()
+
+        fallback_comments = _extract_post_counter(post, "comments")
+        fallback_shares = _extract_post_counter(post, "shares")
+        if _safe_int(insights.get("Comments", 0)) <= 0 and fallback_comments > 0:
+            insights["Comments"] = fallback_comments
+        if _safe_int(insights.get("Shares", 0)) <= 0 and fallback_shares > 0:
+            insights["Shares"] = fallback_shares
 
         if group_key in _METRICS_DEBUG["groups"]:
             _METRICS_DEBUG["groups"][group_key]["posts_processed"] += 1
