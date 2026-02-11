@@ -512,7 +512,7 @@ def _normalize_currency_value(raw_value: Any) -> float:
                 if normalized > 0:
                     return normalized
 
-        numeric_values = [_safe_float(v) for v in raw_value.values()]
+        numeric_values = [_normalize_currency_value(v) for v in raw_value.values()]
         if any(numeric_values):
             return float(sum(numeric_values))
 
