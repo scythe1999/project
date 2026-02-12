@@ -3,7 +3,7 @@
 Facebook Page posts + insights exporter (read-only).
 
 Run:
-  pip install requests
+  pip install requests openpyxl
   export FB_PAGE_ACCESS_TOKEN="..."                # macOS/Linux
   setx FB_PAGE_ACCESS_TOKEN "..."                  # Windows (new terminal)
   python export_fb_posts.py
@@ -78,8 +78,6 @@ INSIGHT_METRICS_CANDIDATES = [
     "post_engaged_users",
     "post_comments",
     "post_shares",
-    "post_negative_feedback",
-    "post_negative_feedback_unique",
     "post_impressions_unique",
     "post_media_view",
     "post_media_views",
@@ -100,9 +98,6 @@ INSIGHT_METRICS_CANDIDATES = [
     "post_video_complete_views_30s",
     "post_video_complete_views_30s_organic",
     "post_video_complete_views_30s_paid",
-    "post_spend",
-    "post_total_spend",
-    "post_amount_spent",
 ]
 
 VIDEO_3S_METRIC_PRIORITY = [
@@ -115,12 +110,6 @@ VIDEO_1M_METRIC_PRIORITY = [
     "post_video_views_1m",
     "post_video_views_60s_excludes_shorter_views",
     "post_video_complete_views_30s",
-]
-
-SPEND_METRIC_PRIORITY = [
-    "post_spend",
-    "post_total_spend",
-    "post_amount_spent",
 ]
 
 CSV_COLUMNS = [
@@ -150,13 +139,10 @@ CSV_COLUMNS = [
     "Total clicks",
     "Link Clicks",
     "Other Clicks",
-    "Negative feedback",
-    "Negative feedback (Unique)",
     "3-second video views",
     "1-minute video views",
     "Seconds viewed (video view time)",
     "Average seconds viewed (video avg time watched)",
-    "Spent per post",
 ]
 
 BASE_COLUMNS = {
@@ -362,10 +348,7 @@ def fetch_posts() -> List[Dict[str, Any]]:
                 and "fields" in params
                 and _looks_like_invalid_fields_error(exc)
             )
-            if (
-                is_field_related_error
-                and fields_index + 1 < len(POST_FIELDS_CANDIDATES)
-            ):
+            if is_field_related_error and fields_index + 1 < len(POST_FIELDS_CANDIDATES):
                 fields_index += 1
                 params["fields"] = POST_FIELDS_CANDIDATES[fields_index]
                 logging.warning(
@@ -493,39 +476,6 @@ def _normalize_scalar_value(raw_value: Any) -> int:
     return 0
 
 
-def _safe_float(value: Any) -> float:
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _normalize_currency_value(raw_value: Any) -> float:
-    """Normalize currency-like insight values across Graph API response variants."""
-    if isinstance(raw_value, (int, float, str)):
-        return _safe_float(raw_value)
-
-    if isinstance(raw_value, dict):
-        for key in ("value", "total_value", "amount", "sum", "total"):
-            if key in raw_value:
-                normalized = _normalize_currency_value(raw_value[key])
-                if normalized > 0:
-                    return normalized
-
-        numeric_values = [_normalize_currency_value(v) for v in raw_value.values()]
-        if any(numeric_values):
-            return float(sum(numeric_values))
-
-    if isinstance(raw_value, list):
-        numeric_values = [_normalize_currency_value(v) for v in raw_value]
-        non_zero = [v for v in numeric_values if v > 0]
-        if non_zero:
-            return max(non_zero)
-        return 0.0
-
-    return 0.0
-
-
 def _zero_insights() -> Dict[str, Any]:
     return {col: 0 for col in CSV_COLUMNS if col not in BASE_COLUMNS}
 
@@ -570,9 +520,7 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not name:
             continue
         raw_value = _value_from_insight(item)
-        if name in SPEND_METRIC_PRIORITY:
-            metrics[name] = _normalize_currency_value(raw_value)
-        elif name in breakdown_metrics:
+        if name in breakdown_metrics:
             metrics[name] = _normalize_breakdown_value(raw_value)
         else:
             metrics[name] = _normalize_scalar_value(raw_value)
@@ -638,6 +586,7 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
     result["Reach"] = reach_total
     result["Reach (Organic)"] = reach_organic
     result["Reach (Paid/Boosted)"] = reach_paid
+
     engaged_users = _safe_int(metrics.get("post_engaged_users", 0))
     if engaged_users <= 0:
         engaged_users = _safe_int(metrics.get("post_clicks_unique", 0))
@@ -647,10 +596,9 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
             _safe_int(metrics.get("post_comments", 0)) + _safe_int(metrics.get("post_shares", 0)),
         )
     result["Engaged users"] = engaged_users
+
     result["Comments"] = _safe_int(metrics.get("post_comments", 0))
     result["Shares"] = _safe_int(metrics.get("post_shares", 0))
-    result["Negative feedback"] = _safe_int(metrics.get("post_negative_feedback", 0))
-    result["Negative feedback (Unique)"] = _safe_int(metrics.get("post_negative_feedback_unique", 0))
 
     reactions = metrics.get("post_reactions_by_type_total", {})
     if isinstance(reactions, dict):
@@ -705,11 +653,6 @@ def parse_insights(payload: Dict[str, Any]) -> Dict[str, Any]:
     result["Average seconds viewed (video avg time watched)"] = _safe_int(
         metrics.get("post_video_avg_time_watched", 0)
     )
-
-    for metric_name in SPEND_METRIC_PRIORITY:
-        if metric_name in metrics:
-            result["Spent per post"] = round(_safe_float(metrics.get(metric_name, 0.0)), 2)
-            break
 
     return result
 
