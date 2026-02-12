@@ -1,200 +1,129 @@
-Write a production-ready Python 3 script that uses the Facebook Graph API to export a Facebook Page’s posts + insights into a single CSV file.
+You are a senior Python engineer. Create a NEW standalone Python script named:
 
-GOAL
-- Fetch all posts from a given Facebook Page within a date range
-- For each post, fetch insights (reach, impressions, reactions, comments, shares, clicks, negative feedback, video metrics, and a 3-second video views breakdown by age/gender if available)
-- Output one row per post to a CSV file (UTF-8)
-- IMPORTANT: Build strong error handling so the script is “safe” and does not break the Page or cause issues. It must:
-  - Never attempt to modify Page data (READ ONLY)
-  - Avoid aggressive request bursts (throttle requests)
-  - Implement robust retries with exponential backoff for transient errors
-  - Handle rate limits (Facebook error codes like 4, 17, 32, 613) by backing off
-  - Handle token/permission errors gracefully and stop with a clear message (no endless loops)
-  - Continue processing other posts even if one post’s insights fail (write zeros/blanks for missing metrics)
-  - Log actions in a clear way (progress + warnings), but DO NOT print the access token
+  export_fb_post_spend.py
 
-CONSTRAINTS
-- Use only: requests + Python standard library (csv, json, time, datetime, logging)
-- Do NOT use the Facebook SDK.
-- Do NOT store or output the access token anywhere except reading it from an environment variable by default.
-- Provide a “dry-run” mode that only fetches the first N posts and prints how many would be exported.
+This script must export "Spent per post" for Facebook Page posts by attributing ad spend to each post via the Marketing API, using Graph API v23.0. The output must be an XLSX file that includes a Post ID join key column so it can be merged with my existing per-post insights export.
 
-CONFIG (constants at top of file)
-- GRAPH_VERSION = "v19.0" (allow easy change)
-- PAGE_ID = "<PAGE_ID>"
-- ACCESS_TOKEN = read from env var "FB_PAGE_ACCESS_TOKEN" (fallback to a placeholder constant if needed)
-- SINCE = "2026-01-01"   (YYYY-MM-DD)
-- UNTIL = "2026-01-31"   (YYYY-MM-DD)
-- OUTPUT_FILE = "fb_page_posts_report.csv"
-- REQUEST_TIMEOUT_SECONDS = 30
-- MAX_RETRIES = 6
-- BASE_BACKOFF_SECONDS = 2
-- MAX_BACKOFF_SECONDS = 120
-- THROTTLE_SECONDS = 0.25  (sleep between requests)
-- DRY_RUN = False
-- DRY_RUN_LIMIT = 25
+DO NOT modify my existing script. This is a new script.
 
-STEP 1 — FETCH PAGE NAME (once)
-GET https://graph.facebook.com/{GRAPH_VERSION}/{PAGE_ID}
-Params: fields=name, access_token=...
+=========================
+GOALS / OUTPUT
+=========================
+1) Produce an XLSX file (openpyxl) with a single sheet "FB Post Spend".
+2) Each row must represent a POST (by post_id), and include:
+   - "Post ID"                     (join key; must match post ids from /{page_id}/posts)
+   - "Spent per post"              (float, rounded to 2 decimals)
+   - "Ad IDs"                      (optional: comma-separated list; helpful for debugging)
+   - "Ads matched"                 (integer count of ads mapped to the post)
+   - "Since"                       (YYYY-MM-DD)
+   - "Until"                       (YYYY-MM-DD)
+   - "Graph version"               (e.g., v23.0)
+3) If a post has no matched spend, still include it with "Spent per post" = 0.0.
+4) This script must fetch the posts itself (same date window as spend). It must not require the user to supply post ids.
 
-STEP 2 — FETCH POSTS (with pagination)
-GET https://graph.facebook.com/{GRAPH_VERSION}/{PAGE_ID}/posts
-Params:
-  fields = "id,created_time,permalink_url,message,story,status_type,type"
-  since = SINCE (convert to unix timestamp)
-  until = UNTIL (convert to unix timestamp)
-  limit = 100
-  access_token = ...
+=========================
+INPUTS / CLI
+=========================
+Implement argparse with flags:
+- --page-id              default from PAGE_ID constant
+- --ad-account-id         default from env AD_ACCOUNT_ID or "<AD_ACCOUNT_ID>"
+- --since                default "YYYY-MM-DD"
+- --until                default "YYYY-MM-DD"
+- --graph-version        default "v23.0"
+- --output               default "fb_post_spend_report.xlsx"
+- --debug                enable debug logging + write JSON debug file
 
-Paginate using paging.next until no more data.
-Collect posts into a list of dicts.
-If DRY_RUN = True: stop after DRY_RUN_LIMIT posts.
+Token:
+- Use env var FB_PAGE_ACCESS_TOKEN as ACCESS_TOKEN (same token used for post insights; assume it has ads permissions).
+- If token missing, exit with a clear fatal error.
 
-Base columns per post:
-- Post ID (id)
-- Publish time (created_time)
-- Permalink (permalink_url)
-- Title (prefer message; else story; else empty)
-- Post type (prefer status_type; else type; else empty)
-- Page name
+=========================
+API / ATTRIBUTION LOGIC
+=========================
+Use Graph base URL: https://graph.facebook.com
 
-STEP 3 — FETCH INSIGHTS PER POST
-For each post:
-GET https://graph.facebook.com/{GRAPH_VERSION}/{POST_ID}/insights
-Params:
-  metric = comma-separated list below
-  period = lifetime
-  access_token = ...
+A) Fetch posts for the Page within the date range:
+   Endpoint: /{graph_version}/{page_id}/posts
+   Params:
+     fields=id,created_time,permalink_url,message,story,status_type,type
+     since=<unix>
+     until=<unix>
+     limit=100
+     access_token=ACCESS_TOKEN
+   Handle paging.next until done.
+   Store a set of post_ids and also a list of post dicts (keep created_time/permalink for context columns optionally).
 
-Metrics to request (ignore unknown metrics gracefully):
-Core:
-- post_impressions
-- post_impressions_unique
-- post_impressions_organic
-- post_impressions_paid
-- post_reach
-- post_reach_organic
-- post_reach_paid
-- post_engaged_users
-- post_clicks
-- post_clicks_unique
-- post_clicks_by_type
-- post_reactions_by_type_total
-- post_comments
-- post_shares
-- post_negative_feedback
-- post_negative_feedback_unique
+B) Fetch ads for the Ad Account and map ads -> effective_object_story_id:
+   Endpoint: /{graph_version}/act_{ad_account_id}/ads
+   Params:
+     fields=id,adcreatives{effective_object_story_id},creative{effective_object_story_id,id},created_time,updated_time,status
+     limit=100
+     access_token=ACCESS_TOKEN
+   Handle paging.
+   For each ad:
+     - Extract ad_id
+     - Extract story_id = effective_object_story_id from adcreatives or creative
+     - If story_id exists AND story_id is in the post_ids set, store mapping: post_id -> list[ad_id]
+   If story_id is missing for an ad, ignore it.
 
-Video (may be missing for non-video posts):
-- post_video_views_3s
-- post_video_views_1m
-- post_video_view_time
-- post_video_avg_time_watched
-- post_video_views_3s_by_age_bucket_and_gender  (breakdown object keys like "M.18-24")
+C) Fetch spend per ad_id using Marketing API insights:
+   Endpoint: /{graph_version}/{ad_id}/insights
+   Params:
+     fields=spend
+     level=ad
+     time_range[since]=SINCE
+     time_range[until]=UNTIL
+     access_token=ACCESS_TOKEN
+   Parse spend as float.
+   Implement caching per ad_id to avoid re-fetch.
+   NOTE: Handle that insights data may be empty -> spend=0.0.
+   Sum spend across all ads mapped to a post.
 
-PARSING RULES
-- Insights response is a list of objects with fields: name, values.
-- For lifetime: use values[0].value (if missing, treat as 0 or {}).
-- Breakdown parsing:
-  A) post_reactions_by_type_total:
-     - value is an object with keys like: like, love, wow, haha, sad, angry (sometimes “sorry” or others)
-     - Create:
-       - Reactions (Total) = sum of all reaction types
-       - Also output each of: like, love, wow, haha, sad, angry (0 if missing)
-  B) post_clicks_by_type:
-     - value is an object with keys like "link clicks" and other click categories
-     - Create:
-       - Total clicks = post_clicks if available else sum of breakdown
-       - Link Clicks = breakdown["link clicks"] if present (also accept "link_clicks")
-       - Other Clicks = sum(breakdown) - Link Clicks
-  C) post_video_views_3s_by_age_bucket_and_gender:
-     - value is an object with keys like:
-       "M.18-24", "M.25-34", "M.35-44", "M.45-54", "M.55-64", "M.65+",
-       "F.18-24", "F.25-34", "F.35-44", "F.45-54", "F.55-64", "F.65+"
-     - Flatten into these CSV columns (0 if missing):
-       - 3s_views_M_18_24
-       - 3s_views_M_25_34
-       - 3s_views_M_35_44
-       - 3s_views_M_45_54
-       - 3s_views_M_55_64
-       - 3s_views_M_65_plus
-       - 3s_views_F_18_24
-       - 3s_views_F_25_34
-       - 3s_views_F_35_44
-       - 3s_views_F_45_54
-       - 3s_views_F_55_64
-       - 3s_views_F_65_plus
+D) Output rows:
+   For each post in the posts list (to ensure 0.0 rows exist), compute:
+     spend = round(sum(spend_by_ad_id), 2)
+   Write XLSX with the required columns.
+   Keep deterministic order: sort by Publish time ascending (created_time) or keep fetched order.
 
-STEP 4 — CSV OUTPUT (one row per post)
-Write UTF-8 CSV with EXACT column order:
-- Post ID
-- Page name
-- Title
-- Publish time
-- Permalink
-- Post type
-- Reach
-- Reach (Organic)
-- Reach (Paid/Boosted)
-- Impressions
-- Impressions (Unique)
-- Impressions (Organic)
-- Impressions (Paid/Boosted)
-- Engaged users
-- Reactions (Total)
-- Reactions (like)
-- Reactions (love)
-- Reactions (wow)
-- Reactions (haha)
-- Reactions (sad)
-- Reactions (angry)
-- Comments
-- Shares
-- Total clicks
-- Link Clicks
-- Other Clicks
-- Negative feedback
-- Negative feedback (Unique)
-- 3-second video views
-- 1-minute video views
-- Seconds viewed (video view time)
-- Average seconds viewed (video avg time watched)
-- 3s_views_M_18_24
-- 3s_views_M_25_34
-- 3s_views_M_35_44
-- 3s_views_M_45_54
-- 3s_views_M_55_64
-- 3s_views_M_65_plus
-- 3s_views_F_18_24
-- 3s_views_F_25_34
-- 3s_views_F_35_44
-- 3s_views_F_45_54
-- 3s_views_F_55_64
-- 3s_views_F_65_plus
+=========================
+RELIABILITY / SAFETY
+=========================
+Implement a robust `graph_get()` helper like my existing script:
+- requests.get with timeout
+- retry up to MAX_RETRIES with exponential backoff + jitter
+- retry on HTTP 429/5xx
+- detect Graph errors in payload.error:
+   - fatal auth/permission codes: {10, 190, 200} => raise FatalGraphAPIError
+   - rate limit codes: {4, 17, 32, 613} => retry
+   - other codes => raise GraphAPIError(code=...)
+- throttle between successful requests (e.g., 0.25s)
 
-ERROR HANDLING (MUST IMPLEMENT)
-- Create a helper function: graph_get(url, params) that:
-  - Adds timeout
-  - Retries on network errors and Facebook transient errors
-  - Uses exponential backoff with jitter
-  - Detects Graph API error structure: {"error": {"message":..., "type":..., "code":..., "error_subcode":..., "fbtrace_id":...}}
-  - For rate limit codes (4, 17, 32, 613) -> backoff and retry
-  - For token/permission errors (e.g., code 190, 10, 200) -> raise a fatal exception with a clear message and stop
-- Throttle between successful requests: sleep(THROTTLE_SECONDS)
-- If an insights request fails for a post after retries:
-  - Log warning and proceed
-  - Fill all insight fields with 0/blank for that post
+Use the same constants:
+REQUEST_TIMEOUT_SECONDS=30, MAX_RETRIES=6, BASE_BACKOFF_SECONDS=2, MAX_BACKOFF_SECONDS=120, THROTTLE_SECONDS=0.25
 
-LOGGING / SAFETY
-- Use logging module
-- Never log or print the access token
-- Print progress like: "Processing post 12/345: <post_id>"
-- End summary: total posts fetched, total rows written, output file path
+Include logging (INFO by default, DEBUG if --debug).
 
+=========================
+DEBUG ARTIFACT
+=========================
+If --debug:
+- Write a JSON file (e.g., spend_debug.json) that includes:
+  - graph_version, page_id, ad_account_id (normalized)
+  - counts: posts_fetched, ads_scanned, ads_with_story_id, posts_matched_to_ads
+  - sample mappings: first N post_id -> ad_ids
+  - sample spend responses (first N ad_ids)
+Be mindful not to log the access token.
+
+=========================
+EDGE CASES
+=========================
+- ad-account-id may be provided as "act_123" or "123"; normalize to numeric, but build URL as act_<id>.
+- If AD_ACCOUNT_ID is missing ("<AD_ACCOUNT_ID>"), do not crash; output spend=0.0 for all posts and log a warning.
+- If a post was boosted via multiple ads, sum all relevant ad spends.
+- If API returns spend strings, parse safely as float.
+
+=========================
 DELIVERABLE
-- Output the complete Python script as a single file content.
-- Include brief run instructions at top:
-  - pip install requests
-  - export FB_PAGE_ACCESS_TOKEN="..."
-  - python export_fb_posts.py
+=========================
+Return the COMPLETE Python script (single file) ready to run.
+No diffs. No placeholders beyond the constants. Do not include any extraneous commentary.
