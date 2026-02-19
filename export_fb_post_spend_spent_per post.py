@@ -2,10 +2,15 @@
 """
 Facebook Page posts + insights exporter (read-only).
 
-Run:
+Run (single page):
   pip install requests openpyxl
   export FB_PAGE_ACCESS_TOKEN="..."                # macOS/Linux
   setx FB_PAGE_ACCESS_TOKEN "..."                  # Windows (new terminal)
+        python export_fb_posts.py --page-id "<PAGE_ID>"
+
+    Run (multiple pages via env prefix):
+    export FB_TOKEN_PAGEA="..."
+    export FB_TOKEN_PAGEB="..."
   python export_fb_posts.py
 
 Notes:
@@ -20,6 +25,7 @@ import os
 import random
 import time
 import argparse
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 import requests
@@ -33,6 +39,7 @@ GRAPH_VERSION = "v23.0"
 PAGE_ID = "101275806400438"
 ACCESS_TOKEN_PLACEHOLDER = "<ACCESS_TOKEN>"
 ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", ACCESS_TOKEN_PLACEHOLDER)
+MULTI_PAGE_TOKEN_PREFIX = "FB_TOKEN_"
 SINCE = "2026-01-01"  # YYYY-MM-DD
 UNTIL = "2026-01-31"  # YYYY-MM-DD
 OUTPUT_FILE = os.path.join(SCRIPT_DIR, "fb_page_posts_report.xlsx")
@@ -171,6 +178,13 @@ class GraphAPIError(RuntimeError):
         super().__init__(message)
         self.code = code
 
+@dataclass
+class PageConfig:
+    env_name: str
+    token: str
+    page_id: Optional[str] = None
+    page_name: Optional[str] = None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -179,6 +193,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--since", default=SINCE, help="Start date YYYY-MM-DD")
     parser.add_argument("--until", default=UNTIL, help="End date YYYY-MM-DD")
     parser.add_argument("--page-id", default=PAGE_ID, help="Facebook Page ID")
+    parser.add_argument(
+        "--token-env",
+        default="FB_PAGE_ACCESS_TOKEN",
+        help="Environment variable name for single-page token mode",
+    )
+    parser.add_argument(
+        "--multi-token-prefix",
+        default=MULTI_PAGE_TOKEN_PREFIX,
+        help="Environment variable prefix for multi-page token discovery",
+    )
     parser.add_argument("--graph-version", default=GRAPH_VERSION, help="Graph API version")
     parser.add_argument("--output", default=OUTPUT_FILE, help="XLSX output file path")
     parser.add_argument(
@@ -324,6 +348,27 @@ def fetch_page_name() -> str:
     params = {"fields": "name", "access_token": ACCESS_TOKEN}
     data = graph_get(url, params)
     return data.get("name", "")
+
+def resolve_page_from_token(token: str) -> Dict[str, str]:
+    url = f"{GRAPH_BASE_URL}/{GRAPH_VERSION}/me"
+    params = {"fields": "id,name", "access_token": token}
+    data = graph_get(url, params)
+    return {
+        "id": data.get("id", ""),
+        "name": data.get("name", ""),
+    }
+
+
+def discover_multi_page_configs(prefix: str) -> List[PageConfig]:
+    configs: List[PageConfig] = []
+    for env_name in sorted(os.environ.keys()):
+        if not env_name.startswith(prefix):
+            continue
+        token = os.getenv(env_name, "").strip()
+        if not token:
+            continue
+        configs.append(PageConfig(env_name=env_name, token=token))
+    return configs
 
 
 def fetch_posts() -> List[Dict[str, Any]]:
@@ -907,9 +952,13 @@ def validate_config() -> None:
             "Access token missing. Set FB_PAGE_ACCESS_TOKEN environment variable."
         )
 
+def reset_page_state() -> None:
+    _METRIC_DISCOVERY_CACHE.clear()
+    _METRIC_USAGE_COUNTS.clear()
+
 
 def main() -> None:
-    global PAGE_ID, SINCE, UNTIL, OUTPUT_FILE, GRAPH_VERSION, _DEBUG_ENABLED, _METRICS_DEBUG
+    global PAGE_ID, SINCE, UNTIL, OUTPUT_FILE, GRAPH_VERSION, _DEBUG_ENABLED, _METRICS_DEBUG, ACCESS_TOKEN
 
     args = parse_args()
     PAGE_ID = args.page_id
@@ -923,27 +972,79 @@ def main() -> None:
     setup_logging()
     if _DEBUG_ENABLED:
         logging.getLogger().setLevel(logging.DEBUG)
-    validate_config()
 
     logging.info("Starting Facebook Page export (read-only mode).")
 
-    page_name = fetch_page_name()
-    logging.info("Resolved page name: %s", page_name)
+    page_configs: List[PageConfig] = []
+    single_token = os.getenv(args.token_env, "").strip()
+    explicit_page_id = bool(args.page_id and args.page_id != "<PAGE_ID>")
 
-    posts = fetch_posts()
-    total_posts = len(posts)
+    if explicit_page_id and single_token:
+        page_configs = [PageConfig(env_name=args.token_env, token=single_token, page_id=args.page_id)]
+    else:
+        page_configs = discover_multi_page_configs(args.multi_token_prefix)
+        if not page_configs and single_token:
+            page_configs = [PageConfig(env_name=args.token_env, token=single_token, page_id=args.page_id)]
+
+    if not page_configs:
+        raise FatalGraphAPIError(
+            "No page tokens found. Set FB_PAGE_ACCESS_TOKEN (+ --page-id) or add FB_TOKEN_* env vars."
+        )
+
+    all_rows: List[Dict[str, Any]] = []
+    total_posts = 0
+
+    for page_config in page_configs:
+        ACCESS_TOKEN = page_config.token
+
+        try:
+            if page_config.page_id:
+                PAGE_ID = page_config.page_id
+                page_name = fetch_page_name()
+            else:
+                identity = resolve_page_from_token(page_config.token)
+                PAGE_ID = identity.get("id", "")
+                page_name = identity.get("name", "")
+                if not PAGE_ID:
+                    raise FatalGraphAPIError(
+                        f"Unable to resolve page id from token in {page_config.env_name}."
+                    )
+        except Exception as exc:
+            logging.warning("Skipping token %s due to setup error: %s", page_config.env_name, exc)
+            continue
+
+        page_config.page_id = PAGE_ID
+        page_config.page_name = page_name
+        logging.info(
+            "Processing page from %s -> id=%s name=%s",
+            page_config.env_name,
+            page_config.page_id,
+            page_config.page_name,
+        )
+
+        reset_page_state()
+        _METRICS_DEBUG = {"graph_version": GRAPH_VERSION, "groups": {}}
+
+        posts = fetch_posts()
+        total_posts += len(posts)
+
+        if DRY_RUN:
+            logging.info(
+                "Dry-run enabled: would export %d posts for page %s.",
+                len(posts),
+                PAGE_ID,
+            )
+            continue
+
+        all_rows.extend(build_rows(posts, page_name))
+        print_metric_summary()
 
     if DRY_RUN:
-        logging.info(
-            "Dry-run enabled: would export %d posts to %s.",
-            total_posts,
-            OUTPUT_FILE,
-        )
+        logging.info("Dry-run complete.")
         return
 
-    rows = build_rows(posts, page_name)
+    rows = all_rows
     write_xlsx(rows)
-    print_metric_summary()
 
     if _DEBUG_ENABLED:
         write_metrics_debug()
