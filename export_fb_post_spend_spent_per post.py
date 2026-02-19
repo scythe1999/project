@@ -40,7 +40,7 @@ PAGE_ID = "101275806400438"
 ACCESS_TOKEN_PLACEHOLDER = "<ACCESS_TOKEN>"
 ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", ACCESS_TOKEN_PLACEHOLDER)
 MULTI_PAGE_TOKEN_PREFIX = "FB_TOKEN_"
-SINCE = "2026-01-01"  # YYYY-MM-DD
+SINCE = "2025-01-01"  # YYYY-MM-DD
 UNTIL = "2026-01-31"  # YYYY-MM-DD
 OUTPUT_FILE = os.path.join(SCRIPT_DIR, "fb_page_posts_report.xlsx")
 METRICS_DEBUG_FILE = os.path.join(SCRIPT_DIR, "metrics_debug.json")
@@ -49,6 +49,9 @@ MAX_RETRIES = 6
 BASE_BACKOFF_SECONDS = 2
 MAX_BACKOFF_SECONDS = 120
 THROTTLE_SECONDS = 0.25
+USE_BATCH_INSIGHTS = True
+BATCH_SIZE = 25
+BATCH_THROTTLE_SECONDS = 0.4
 DRY_RUN = False
 DRY_RUN_LIMIT = 25
 
@@ -165,7 +168,7 @@ _METRIC_DISCOVERY_CACHE: Dict[str, List[str]] = {}
 _METRICS_DEBUG: Dict[str, Any] = {"graph_version": GRAPH_VERSION, "groups": {}}
 _METRIC_USAGE_COUNTS: Dict[str, int] = {}
 _DEBUG_ENABLED = False
-
+SESSION = requests.Session()
 
 class FatalGraphAPIError(RuntimeError):
     """Fatal Graph API issue that should stop script execution."""
@@ -266,7 +269,7 @@ def graph_get(
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            response = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
             status = response.status_code
 
             # Retry common transient HTTP statuses.
@@ -348,6 +351,41 @@ def fetch_page_name() -> str:
     params = {"fields": "name", "access_token": ACCESS_TOKEN}
     data = graph_get(url, params)
     return data.get("name", "")
+
+
+def _metrics_cache_file(page_id: str) -> str:
+    return os.path.join(SCRIPT_DIR, f"metrics_cache_{page_id}.json")
+
+
+def load_metrics_cache(page_id: str) -> None:
+    cache_path = _metrics_cache_file(page_id)
+    if not os.path.exists(cache_path):
+        return
+    try:
+        with open(cache_path, "r", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+        if isinstance(payload, dict):
+            _METRIC_DISCOVERY_CACHE.update(
+                {
+                    key: value
+                    for key, value in payload.items()
+                    if isinstance(key, str) and isinstance(value, list)
+                }
+            )
+            logging.info("Loaded metric discovery cache: %s", cache_path)
+    except Exception as exc:
+        logging.warning("Unable to read metrics cache %s: %s", cache_path, exc)
+
+
+def save_metrics_cache(page_id: str) -> None:
+    cache_path = _metrics_cache_file(page_id)
+    try:
+        with open(cache_path, "w", encoding="utf-8") as cache_file:
+            json.dump(_METRIC_DISCOVERY_CACHE, cache_file, indent=2, ensure_ascii=False)
+        logging.info("Saved metric discovery cache: %s", cache_path)
+    except Exception as exc:
+        logging.warning("Unable to write metrics cache %s: %s", cache_path, exc)
+
 
 def resolve_page_from_token(token: str) -> Dict[str, str]:
     url = f"{GRAPH_BASE_URL}/{GRAPH_VERSION}/me"
@@ -835,6 +873,152 @@ def fetch_post_insights(post_id: str, valid_metrics: List[str], group_key: str) 
     return _zero_insights()
 
 
+def _sleep_batch_throttle() -> None:
+    time.sleep(BATCH_THROTTLE_SECONDS + random.uniform(0, 0.3))
+
+
+def _chunked(items: List[str], size: int) -> List[List[str]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _graph_batch_post(batch_items: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    url = f"{GRAPH_BASE_URL}/{GRAPH_VERSION}"
+    params = {
+        "access_token": ACCESS_TOKEN,
+        "batch": json.dumps(batch_items, separators=(",", ":")),
+    }
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = SESSION.post(url, data=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            status = response.status_code
+            if status in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"HTTP {status}", response=response)
+
+            payload = response.json()
+            if isinstance(payload, dict) and "error" in payload:
+                error_obj = payload.get("error", {})
+                code = error_obj.get("code")
+                summary = _safe_error_summary(error_obj)
+
+                if code in FATAL_AUTH_PERMISSION_CODES:
+                    raise FatalGraphAPIError(
+                        "Fatal token/permission error from Graph API. "
+                        "Check token validity/scopes/page roles. "
+                        f"{summary}"
+                    )
+
+                if code in RATE_LIMIT_CODES:
+                    raise requests.HTTPError(
+                        f"Rate limit Graph error code={code}: {summary}",
+                        response=response,
+                    )
+                raise GraphAPIError(f"Graph API error: {summary}", code=code)
+
+            if not isinstance(payload, list):
+                raise ValueError("Unexpected batch response payload type.")
+
+            return payload
+        except FatalGraphAPIError:
+            raise
+        except (requests.RequestException, GraphAPIError, ValueError) as exc:
+            if attempt >= MAX_RETRIES:
+                raise RuntimeError(
+                    f"Batch request failed after {MAX_RETRIES} attempts for {url}: {exc}"
+                ) from exc
+
+            exp_delay = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            jitter = random.uniform(0, 1)
+            delay = min(MAX_BACKOFF_SECONDS, exp_delay + jitter)
+            logging.warning(
+                "Batch attempt %s/%s failed; retrying in %.2fs. Error: %s",
+                attempt,
+                MAX_RETRIES,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("Unexpected batch request flow.")
+
+
+def fetch_post_insights_batch(
+    post_ids: List[str], valid_metrics: List[str], group_key: str
+) -> Dict[str, Dict[str, Any]]:
+    # Fetch many post insights in conservative Graph batches to reduce per-post HTTP calls.
+    results: Dict[str, Dict[str, Any]] = {post_id: _zero_insights() for post_id in post_ids}
+    if not post_ids or not valid_metrics:
+        return results
+
+    metrics_to_request = list(valid_metrics)
+    safe_batch_size = max(1, min(BATCH_SIZE, 50))
+
+    for chunk in _chunked(post_ids, safe_batch_size):
+        while metrics_to_request:
+            batch_items = [
+                {
+                    "method": "GET",
+                    "relative_url": (
+                        f"{GRAPH_VERSION}/{post_id}/insights?"
+                        f"metric={','.join(metrics_to_request)}&period=lifetime"
+                    ),
+                }
+                for post_id in chunk
+            ]
+
+            batch_payload = _graph_batch_post(batch_items)
+            should_retry_chunk = False
+
+            for index, item in enumerate(batch_payload):
+                post_id = chunk[index]
+                code = _safe_int(item.get("code", 0))
+                body_str = item.get("body", "")
+                body: Dict[str, Any] = {}
+
+                if isinstance(body_str, str) and body_str:
+                    try:
+                        parsed_body = json.loads(body_str)
+                        if isinstance(parsed_body, dict):
+                            body = parsed_body
+                    except json.JSONDecodeError:
+                        body = {}
+
+                if code != 200 or "error" in body:
+                    error_obj = body.get("error", {}) if isinstance(body, dict) else {}
+                    graph_code = error_obj.get("code")
+                    if graph_code == INVALID_QUERY_CODE:
+                        _METRIC_DISCOVERY_CACHE[group_key] = []
+                        group_info = _METRICS_DEBUG["groups"].get(group_key, {})
+                        group_info["valid_metrics"] = []
+                        metrics_to_request = []
+                        should_retry_chunk = False
+                        break
+
+                    if graph_code == INVALID_METRIC_CODE:
+                        invalid_name = _extract_invalid_metric_name(
+                            str(error_obj.get("message", ""))
+                        )
+                        if invalid_name and invalid_name in metrics_to_request:
+                            metrics_to_request.remove(invalid_name)
+                            cached = _METRIC_DISCOVERY_CACHE.get(group_key, [])
+                            _METRIC_DISCOVERY_CACHE[group_key] = [m for m in cached if m != invalid_name]
+                            group_info = _METRICS_DEBUG["groups"].get(group_key, {})
+                            group_info["valid_metrics"] = _METRIC_DISCOVERY_CACHE[group_key]
+                            should_retry_chunk = True
+                            break
+
+                    results[post_id] = _zero_insights()
+                    continue
+
+                results[post_id] = parse_insights(body)
+
+            if not should_retry_chunk:
+                break
+
+        _sleep_batch_throttle()
+
+    return results
+
 def post_to_base_row(post: Dict[str, Any], page_name: str) -> Dict[str, Any]:
     return {
         "Post ID": post.get("id", ""),
@@ -849,7 +1033,8 @@ def post_to_base_row(post: Dict[str, Any], page_name: str) -> Dict[str, Any]:
 def build_rows(posts: List[Dict[str, Any]], page_name: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     total = len(posts)
-
+    grouped_posts: Dict[str, List[Dict[str, Any]]] = {}
+    prepared: List[Dict[str, Any]] = []
     for idx, post in enumerate(posts, start=1):
         post_id = post.get("id", "")
         logging.info("Processing post %d/%d: %s", idx, total, post_id)
@@ -858,14 +1043,23 @@ def build_rows(posts: List[Dict[str, Any]], page_name: str) -> List[Dict[str, An
         group_key = _derive_post_group_key(post)
         _METRIC_USAGE_COUNTS[group_key] = _METRIC_USAGE_COUNTS.get(group_key, 0) + 1
 
+        item = {"post": post, "post_id": post_id, "group_key": group_key, "row": row}
+        prepared.append(item)
+        grouped_posts.setdefault(group_key, []).append(item)
+
+    insights_by_post_id: Dict[str, Dict[str, Any]] = {}
+    for group_key, group_items in grouped_posts.items():
+        sample_post_id = next((item["post_id"] for item in group_items if item["post_id"]), "")
         valid_metrics: List[str] = []
-        if post_id:
+
+        valid_metrics: List[str] = []
+        if sample_post_id:
             try:
-                valid_metrics = resolve_valid_metrics_for_group(post_id, group_key)
+                valid_metrics = resolve_valid_metrics_for_group(sample_post_id, group_key)
             except Exception as exc:
                 logging.warning(
                     "Metric discovery failed for post %s (group %s); using zeroed insights. Error: %s",
-                    post_id,
+                    sample_post_id,
                     group_key,
                     exc,
                 )
@@ -873,7 +1067,7 @@ def build_rows(posts: List[Dict[str, Any]], page_name: str) -> List[Dict[str, An
                 group_info = _METRICS_DEBUG["groups"].setdefault(
                     group_key,
                     {
-                        "sample_post_id": post_id,
+                        "sample_post_id": sample_post_id,
                         "valid_metrics": [],
                         "posts_processed": 0,
                         "raw_insights_payload": None,
@@ -881,19 +1075,45 @@ def build_rows(posts: List[Dict[str, Any]], page_name: str) -> List[Dict[str, An
                 )
                 group_info["valid_metrics"] = []
         else:
-            logging.warning("Post missing id; insight fields will be zeroed.")
+            logging.warning("Group %s has posts missing id; insight fields will be zeroed.", group_key)
 
-        try:
-            insights = fetch_post_insights(post_id, valid_metrics, group_key)
-        except FatalGraphAPIError:
-            raise
-        except Exception as exc:
-            logging.warning(
-                "Insights failed for post %s after retries; using zeroed metrics. Error: %s",
-                post_id,
-                exc,
-            )
-            insights = _zero_insights()
+        group_post_ids = [item["post_id"] for item in group_items if item["post_id"]]
+        if USE_BATCH_INSIGHTS and group_post_ids:
+            try:
+                batch_results = fetch_post_insights_batch(group_post_ids, valid_metrics, group_key)
+                insights_by_post_id.update(batch_results)
+            except FatalGraphAPIError:
+                raise
+            except Exception as exc:
+                logging.warning(
+                    "Batch insights failed for group %s; falling back to per-post reads. Error: %s",
+                    group_key,
+                    exc,
+                )
+
+        if not USE_BATCH_INSIGHTS or not group_post_ids or any(
+            post_id not in insights_by_post_id for post_id in group_post_ids
+        ):
+            for post_id in group_post_ids:
+                try:
+                    insights_by_post_id[post_id] = fetch_post_insights(post_id, valid_metrics, group_key)
+                except FatalGraphAPIError:
+                    raise
+                except Exception as exc:
+                    logging.warning(
+                        "Insights failed for post %s after retries; using zeroed metrics. Error: %s",
+                        post_id,
+                        exc,
+                    )
+                    insights_by_post_id[post_id] = _zero_insights()
+
+    for item in prepared:
+        post = item["post"]
+        post_id = item["post_id"]
+        group_key = item["group_key"]
+        row = item["row"]
+
+        insights = insights_by_post_id.get(post_id, _zero_insights()) if post_id else _zero_insights()
 
         fallback_comments = _extract_post_counter(post, "comments")
         fallback_shares = _extract_post_counter(post, "shares")
@@ -1023,6 +1243,8 @@ def main() -> None:
         )
 
         reset_page_state()
+        # Cache valid metrics per page to avoid rediscovery on repeat runs.
+        load_metrics_cache(PAGE_ID)
         _METRICS_DEBUG = {"graph_version": GRAPH_VERSION, "groups": {}}
 
         posts = fetch_posts()
@@ -1034,10 +1256,13 @@ def main() -> None:
                 len(posts),
                 PAGE_ID,
             )
+            save_metrics_cache(PAGE_ID)
             continue
 
         all_rows.extend(build_rows(posts, page_name))
         print_metric_summary()
+        save_metrics_cache(PAGE_ID)
+
 
     if DRY_RUN:
         logging.info("Dry-run complete.")
