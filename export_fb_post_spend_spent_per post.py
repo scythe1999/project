@@ -27,6 +27,7 @@ import time
 import argparse
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
+from datetime import date
 
 import requests
 from openpyxl import Workbook
@@ -40,8 +41,12 @@ PAGE_ID = "101275806400438"
 ACCESS_TOKEN_PLACEHOLDER = "<ACCESS_TOKEN>"
 ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", ACCESS_TOKEN_PLACEHOLDER)
 MULTI_PAGE_TOKEN_PREFIX = "FB_TOKEN_"
-SINCE = "2025-01-01"  # YYYY-MM-DD
-UNTIL = "2026-01-31"  # YYYY-MM-DD
+# SINCE = "2025-01-01"  # YYYY-MM-DD
+# UNTIL = "2026-01-31"  # YYYY-MM-DD
+
+
+SINCE = "2025-01-01"
+UNTIL = date.today().isoformat()
 OUTPUT_FILE = os.path.join(SCRIPT_DIR, "fb_page_posts_report.xlsx")
 METRICS_DEBUG_FILE = os.path.join(SCRIPT_DIR, "metrics_debug.json")
 REQUEST_TIMEOUT_SECONDS = 30
